@@ -1,0 +1,19 @@
+{
+  "name": "ambassador_shirt",
+  "hsv_ranges": [
+    [
+      [
+        119,
+        60,
+        76
+      ],
+      [
+        131,
+        255,
+        255
+      ]
+    ]
+  ],
+  "samples": 162,
+  "min_blob_area": 1500
+}

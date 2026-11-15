@@ -1,152 +1,267 @@
 #!/usr/bin/env python3
-"""
-Live Phone Camera Shirt Color Recognition — Main Orchestration.
-
-Orchestrates:
-- Phone camera streaming (phone_stream.py)
-- Shirt color click-calibration (calibration.py)
-- YOLO-pose torso extraction & color detection (shirt_detector.py)
-"""
-
+"""Live shirt colour recognition using calibrated HSV ranges and YOLO-pose torso isolation."""
 from __future__ import annotations
-
 import argparse
+import json
+from pathlib import Path
 import time
-from typing import Optional
-
+from collections import deque
 import cv2
 import numpy as np
+from torso import isolate_torso_mask
 
-from calibration import ClickCalibrator, load_calibration, save_calibration
-from phone_stream import PhoneStream
-from shirt_detector import ShirtDetector
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live Phone Camera Shirt Color Recognition")
-    parser.add_argument("--source", default=None, help="Phone URL (http://IP:4747/video), device index (0), or file")
-    parser.add_argument("--phone-ip", default=None, help="Phone IP address (paired with --app)")
-    parser.add_argument("--app", default="droidcam", choices=["droidcam", "ipwebcam"], help="Phone streaming app")
-    parser.add_argument("--colour-file", default="colour.json", help="Path to calibrated colors JSON")
-    parser.add_argument("--model", default="yolo11n-pose.pt", help="YOLO-pose model weights")
-    parser.add_argument("--threshold", type=float, default=0.35, help="Match ratio threshold")
-    parser.add_argument("--headless", action="store_true", help="Run without UI window")
-    parser.add_argument("--max-frames", type=int, default=None, help="Exit after N frames")
-    return parser.parse_args()
+MATCH='match'; OTHER='other'; UNKNOWN='unknown'
+GREEN=(105,232,125); RED=(75,75,255); AMBER=(70,200,255); WHITE=(240,245,248)
+FONT=cv2.FONT_HERSHEY_SIMPLEX
 
 
-def main() -> None:
-    args = parse_args()
+class ShirtClassifier:
+    """HSV shirt colour classifier using calibrated ranges from colour.json."""
+    def __init__(self, ranges, min_pixels=120, match_min=.25, other_max=.10):
+        if not 0 <= other_max < match_min <= 1: raise ValueError('Invalid colour thresholds')
+        self.ranges=[]
+        for lo,hi in ranges:
+            if len(lo)!=3 or len(hi)!=3 or not all(0<=a<=b<=m for a,b,m in zip(lo,hi,(179,255,255))):
+                raise ValueError('Invalid HSV range')
+            self.ranges.append((np.array(lo,np.uint8),np.array(hi,np.uint8)))
+        if not self.ranges:raise ValueError('No HSV ranges provided')
+        self.min_pixels=min_pixels;self.match_min=match_min;self.other_max=other_max
 
-    # 1. Resolve phone source
-    if args.phone_ip:
-        port = 4747 if args.app == "droidcam" else 8080
-        source = f"http://{args.phone_ip}:{port}/video"
-    elif args.source:
-        source = args.source
+    def fraction(self,hsv,mask):
+        if hsv.size==0 or mask.size==0:return None
+        valid=mask>0; n=np.count_nonzero(valid)
+        if n<self.min_pixels:return None
+        hit=np.zeros(mask.shape,np.uint8)
+        for lo,hi in self.ranges:hit |= cv2.inRange(hsv,lo,hi)
+        return np.count_nonzero((hit>0)&valid)/n
+
+    def classify(self,hsv,mask):
+        fraction=self.fraction(hsv,mask)
+        if fraction is None:return UNKNOWN
+        return MATCH if fraction>=self.match_min else OTHER if fraction<=self.other_max else UNKNOWN
+
+
+class MultiColourClassifier:
+    """One separately calibrated HSV profile per named colour."""
+    def __init__(self,profiles,match_min=.25,other_max=.10,margin=.08):
+        if not 0 <= margin <= 1:raise ValueError('Invalid colour margin')
+        self.profiles={name:ShirtClassifier(ranges,match_min=match_min,other_max=other_max)
+                       for name,ranges in profiles.items()}
+        if not self.profiles:raise ValueError('No colour profiles')
+        self.match_min=match_min;self.other_max=other_max;self.margin=margin
+
+    def classify(self,hsv,mask):
+        scores=[(c.fraction(hsv,mask),name) for name,c in self.profiles.items()]
+        if any(score is None for score,name in scores):return UNKNOWN
+        scores.sort(reverse=True)
+        best,name=scores[0]
+        if best<=self.other_max:return OTHER
+        if best<self.match_min:return UNKNOWN
+        if len(scores)>1 and best-scores[1][0]<self.margin:return UNKNOWN
+        return name
+
+
+def colour_label(colour,color_name):
+    return color_name.upper() if colour==MATCH else 'OTHER' if colour==OTHER else 'CHECK SHIRT' if colour==UNKNOWN else colour.upper()
+
+
+def fit(frame,width,height):
+    h,w=frame.shape[:2];s=min(width/w,(height-60)/h)
+    nw,nh=max(1,round(w*s)),max(1,round(h*s))
+    return cv2.resize(frame,(nw,nh),interpolation=cv2.INTER_LINEAR if s>1 else cv2.INTER_AREA),nw/w,nh/h
+
+
+def text(img,label,x,y,scale=.65,colour=WHITE,thick=2):
+    w=img.shape[1]; x=max(0,int(x)); y=int(y)
+    tw=cv2.getTextSize(label,FONT,scale,thick)[0][0]
+    if tw>w-x-8:scale*=max(.1,(w-x-8)/max(1,tw))
+    cv2.putText(img,label,(x,y),FONT,scale,colour,thick,cv2.LINE_AA)
+
+
+def label(img,value,center,y,c):
+    h,w=img.shape[:2];scale=.68;thick=2
+    tw,th=cv2.getTextSize(value,FONT,scale,thick)[0]
+    if tw>w-16:
+        scale*= (w-16)/tw;tw,th=cv2.getTextSize(value,FONT,scale,thick)[0]
+    x=max(4,min(w-tw-12,int(center-tw/2-4)));y=max(th+10,min(h-5,int(y)))
+    cv2.rectangle(img,(x,y-th-7),(min(w-1,x+tw+10),y+5),(20,24,30),-1)
+    text(img,value,x+5,y,scale,c,thick)
+
+
+def render(frame,people,color_name,width=1100,height=780,rate=0,cap=0,offline=False):
+    img,sx,sy=fit(frame,width,height);h,w=img.shape[:2]
+    for box,colour in people:
+        x1,y1,x2,y2=[round(v*s) for v,s in zip(box,(sx,sy,sx,sy))]
+        x1=max(0,min(w-1,x1));x2=max(0,min(w-1,x2));y1=max(0,min(h-1,y1));y2=max(0,min(h-1,y2))
+        c=RED if colour==OTHER else AMBER if colour==UNKNOWN else GREEN
+        cv2.rectangle(img,(x1,y1),(x2,y2),c,3,cv2.LINE_AA)
+        name=colour_label(colour,color_name)
+        label(img,name,(x1+x2)/2,y1-7,c)
+    status=np.full((56,w,3),25,np.uint8)
+    if offline:
+        status[:]=(36,75,125);text(status,'CAMERA OFFLINE - reconnecting',10,23,.7,WHITE)
     else:
-        source = "http://127.0.0.1:4747/video"
+        text(status,f'Looking for: {color_name}',10,24,.70,GREEN)
+    text(status,f'People {len(people)} | AI {rate:.1f} FPS | Camera {cap:.1f}',10,46,.55,WHITE,1)
+    return np.vstack((img,status))
 
-    print(f"[Main] Connecting to phone stream: {source}")
-    cam = PhoneStream(source)
 
-    # 2. Load calibration (strictly no uncalibrated presets)
-    calibrated_ranges = load_calibration(args.colour_file)
-    if calibrated_ranges:
-        print(f"[Main] Loaded calibrated ranges from {args.colour_file}")
+
+def zone_for(box, frame_width, split=.5):
+    """Use the centre of the person box; a zone is an image region, not a doorway."""
+    return 1 if (float(box[0])+float(box[2]))/2 < frame_width*split else 2
+
+
+def zone_summary(people, frame_width, split=.5, allowed=None):
+    """Only a confident non-match in Zone 2 triggers a violation."""
+    allowed={MATCH} if allowed is None else allowed
+    violations=sum(colour!=UNKNOWN and colour not in allowed and zone_for(box,frame_width,split)==2
+                   for box,colour in people)
+    reviews=sum(colour==UNKNOWN and zone_for(box,frame_width,split)==2
+                for box,colour in people)
+    return violations,reviews
+
+
+def render_zones(frame,people,color_name,width=1100,height=780,rate=0,cap=0,
+                 offline=False,split=.5,allowed=None):
+    # Fit the actual image into the available screen area. No fixed-size canvas
+    # or black padding: the header and footer are exactly the image width.
+    header_h,footer_h=36,66
+    h0,w0=frame.shape[:2]
+    scale=min(width/w0,(height-header_h-footer_h)/h0)
+    w,h=max(1,round(w0*scale)),max(1,round(h0*scale))
+    img=cv2.resize(frame,(w,h),interpolation=cv2.INTER_LINEAR if scale>1 else cv2.INTER_AREA)
+    sx,sy=w/w0,h/h0
+    line=max(1,min(w-1,round(w*split)))
+    cv2.line(img,(line,0),(line,h-1),WHITE,2,cv2.LINE_AA)
+    allowed={MATCH} if allowed is None else allowed
+    allowed_label="PURPLE" if allowed=={MATCH} else "/".join(sorted(allowed)).upper()
+    violations,reviews=zone_summary(people,w0,split,allowed) if not offline else (0,0)
+    for box,colour in people if not offline else []:
+        zone=zone_for(box,w0,split)
+        violation=zone==2 and colour!=UNKNOWN and colour not in allowed
+        review=zone==2 and colour==UNKNOWN
+        c=RED if violation else AMBER if review or colour==UNKNOWN else GREEN
+        x1,y1,x2,y2=[round(v*s) for v,s in zip(box,(sx,sy,sx,sy))]
+        x1=max(0,min(w-1,x1)); x2=max(0,min(w-1,x2))
+        y1=max(0,min(h-1,y1)); y2=max(0,min(h-1,y2))
+        cv2.rectangle(img,(x1,y1),(x2,y2),c,3,cv2.LINE_AA)
+        name=colour_label(colour,'purple' if colour==MATCH else color_name)
+        label(img,name,(x1+x2)/2,y1-7,c)
+    header=np.full((header_h,w,3),25,np.uint8)
+    header[:,:line]=(36,70,43); header[:,line:]=(79,49,67)
+    cv2.line(header,(line,0),(line,header_h-1),WHITE,2)
+    def zone_title(value,left,right):
+        available=max(1,right-left-12)
+        fs=.65; thick=1
+        tw=cv2.getTextSize(value,FONT,fs,thick)[0][0]
+        fs*=min(1,available/max(1,tw))
+        tw=cv2.getTextSize(value,FONT,fs,thick)[0][0]
+        cv2.putText(header,value,(max(left+3,(left+right-tw)//2),24),FONT,fs,WHITE,thick,cv2.LINE_AA)
+    zone_title('ZONE 1 - ALL',0,line)
+    zone_title('ZONE 2 - '+allowed_label+' ONLY',line,w)
+    status=np.full((footer_h,w,3),25,np.uint8)
+    if offline:
+        status[:]=(36,75,125); msg='CAMERA OFFLINE - reconnecting'; c=WHITE
+    elif violations:
+        status[:]=(35,35,170);msg=f'ALERT: {violations} UNAUTHORISED IN ZONE 2';c=WHITE
+    elif reviews:
+        status[:]=(35,85,130);msg=f'CHECK SHIRT: {reviews} IN ZONE 2';c=WHITE
     else:
-        print(f"[Main] No calibration found in {args.colour_file}. Click on shirt in camera to calibrate.")
+        msg='ALL CLEAR - no restricted entry';c=GREEN
+    text(status,msg,10,25,.72,c)
+    text(status,f'People {len(people) if not offline else 0} | AI {rate:.1f} FPS | Camera {cap:.1f}',10,51,.62,WHITE,1)
+    return np.vstack((header,img,status))
 
-    # 3. Initialize YOLO-pose shirt detector
-    print(f"[Main] Initializing YOLO-pose detector: {args.model}")
-    detector = ShirtDetector(model_path=args.model, threshold=args.threshold)
 
-    # 4. Initialize in-place click calibrator
-    calibrator = ClickCalibrator()
-    current_frame: Optional[np.ndarray] = None
+def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--source',default='0');ap.add_argument('--profile',default='colour.json');ap.add_argument('--model',default='yolo11n-pose.pt')
+    ap.add_argument('--colour',action='append',default=[],metavar='NAME=FILE',help='Independent named colour profile; repeat for each colour')
+    ap.add_argument('--allow-zone2',nargs='+',default=None,metavar='COLOUR',help='Allowed named colours in Zone 2 (default purple)')
+    ap.add_argument('--colour-margin',type=float,default=.08,help='Minimum lead over second colour')
+    ap.add_argument('--imgsz',type=int,default=640);ap.add_argument('--device')
+    ap.add_argument('--width',type=int,default=1100);ap.add_argument('--height',type=int,default=780)
+    ap.add_argument('--match-min',type=float,default=.25);ap.add_argument('--other-max',type=float,default=.10)
+    ap.add_argument('--two-zones',action='store_true',help='Zone 1: all; Zone 2: calibrated purple shirts only')
+    ap.add_argument('--split',type=float,default=.5,help='Horizontal fraction of the zone boundary (default .5)')
+    a=ap.parse_args()
+    if not .15 <= a.split <= .85:ap.error('--split must be between .15 and .85')
+    if a.width<400 or a.height<350:ap.error('preview at least 400 x 350')
+    def load_ranges(filename):
+        p=Path(filename)
+        if not p.is_file():ap.error(f'{filename} not found — run calibrate_colour.py first')
+        data=json.loads(p.read_text(encoding='utf-8'))
+        print(f'[colour] loaded {p}: {data.get("name","shirt")} {data["hsv_ranges"]}',flush=True)
+        return data
+    allowed=None
+    if a.colour:
+        profiles={}
+        for spec in a.colour:
+            name,sep,filename=spec.partition('=');name=name.strip().lower()
+            if not sep or not name or not filename or name in (MATCH,OTHER,UNKNOWN) or name in profiles:
+                ap.error('Each --colour must have a unique NAME=FILE (not match, other or unknown)')
+            profiles[name]=load_ranges(filename)['hsv_ranges']
+        classifier=MultiColourClassifier(profiles,a.match_min,a.other_max,a.colour_margin)
+        color_name=', '.join(profiles)
+        allowed={n.lower() for n in (a.allow_zone2 or ['purple'])}
+        if a.two_zones and not allowed.issubset(profiles):ap.error('--allow-zone2 must name calibrated colours; default is purple')
+    else:
+        if a.allow_zone2 is not None:ap.error('--allow-zone2 requires named --colour profiles')
+        data=load_ranges(a.profile)
+        color_name=data.get('name','shirt')
+        classifier=ShirtClassifier(data['hsv_ranges'],match_min=a.match_min,other_max=a.other_max)
+    from ultralytics import YOLO
+    from video_source import StreamSource,open_source
+    model=YOLO(a.model);src=open_source(a.source)
+    window='Two-zone Access Test' if a.two_zones else 'Shirt Colour Recognition'
+    cv2.namedWindow(window,cv2.WINDOW_AUTOSIZE if a.two_zones else cv2.WINDOW_NORMAL|cv2.WINDOW_KEEPRATIO)
+    def preview(frame,people,rate=0,cap=0,offline=False):
+        if a.two_zones:
+            return render_zones(frame,people,color_name,a.width,a.height,rate,cap,offline,a.split,allowed)
+        return render(frame,people,color_name,a.width,a.height,rate,cap,offline)
+    last_at=None;last_frame=None;last_size=None;times=deque(maxlen=30)
 
-    window_name = "Shirt Color Recognition (Click: Calibrate | s: Save | r: Reset | q: Quit)"
-    if not args.headless:
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    def show(img):
+        nonlocal last_size
+        size=(img.shape[1],img.shape[0]);cv2.imshow(window,img)
+        if size!=last_size:
+            if not a.two_zones:cv2.resizeWindow(window,*size)
+            last_size=size
 
-    def on_click(event: int, x: int, y: int, *_) -> None:
-        nonlocal calibrated_ranges, current_frame
-        if event == cv2.EVENT_LBUTTONDOWN and current_frame is not None:
-            n_px = calibrator.add_click(current_frame, x, y)
-            new_ranges = calibrator.compute_ranges()
-            if new_ranges:
-                calibrated_ranges = new_ranges
-                save_calibration(calibrated_ranges, args.colour_file)
-                print(f"[Calibrate] Sampled {n_px} px (Total: {calibrator.total_samples}). Updated {args.colour_file}!")
-
-    if not args.headless:
-        cv2.setMouseCallback(window_name, on_click)
-
-    frame_count = 0
-    t0 = time.time()
+    def keys():
+        if cv2.waitKey(1)&255 in (ord('q'),27):return True
+        try:return cv2.getWindowProperty(window,cv2.WND_PROP_VISIBLE)<1
+        except cv2.error:return True
 
     try:
         while True:
-            frame = cam.read()
+            frame,ts=src.read();now=time.monotonic()
             if frame is None:
-                if not args.headless:
-                    canvas = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(canvas, f"Waiting for Phone Camera: {source}", (40, 240),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 180, 255), 2)
-                    cv2.imshow(window_name, canvas)
-                    if (cv2.waitKey(50) & 0xFF) in (ord("q"), 27):
-                        break
+                if not isinstance(src,StreamSource):break
+                if last_at is None or now-last_at>1:
+                    base=last_frame if last_frame is not None else np.zeros((480,640,3),np.uint8)
+                    show(preview(base,[],offline=True))
+                if keys():break
                 continue
+            last_at=now;last_frame=frame
+            args_dict=dict(imgsz=a.imgsz,conf=.30,iou=.50,verbose=False)
+            if a.device:args_dict['device']=a.device
+            results=model(frame,**args_dict);people=[]
+            if results and results[0].boxes is not None and len(results[0].boxes):
+                r=results[0];boxes=r.boxes.xyxy.cpu().numpy()
+                kps=r.keypoints.data.cpu().numpy() if r.keypoints is not None and r.keypoints.data is not None else None
+                hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
+                for i,box in enumerate(boxes):
+                    torso=isolate_torso_mask(frame.shape,i,boxes,kps[i] if kps is not None and i<len(kps) else None)
+                    x1,y1,x2,y2=torso.crop_bbox
+                    raw=classifier.classify(hsv[y1:y2,x1:x2],torso.crop_mask)
+                    if torso.tier==4 and raw==OTHER:raw=UNKNOWN
+                    people.append((box,raw))
+            times.append(time.monotonic());rate=(len(times)-1)/max(.001,times[-1]-times[0]) if len(times)>1 else 0
+            show(preview(frame,people,rate,getattr(src,'capture_fps',0)))
+            if keys():break
+    except KeyboardInterrupt:pass
+    finally:src.close();cv2.destroyAllWindows()
 
-            current_frame = frame
-            frame_count += 1
-            annotated = frame.copy()
-
-            # Run detection
-            detections = detector.detect(frame, calibrated_ranges)
-            matched_count = 0
-
-            for det in detections:
-                poly = det["poly"]
-                if det["is_match"]:
-                    matched_count += 1
-                    cv2.polylines(annotated, [poly], True, (0, 255, 0), 3)
-                    lbl = f"SHIRT MATCH ({int(det['ratio'] * 100)}%)"
-                    cv2.putText(annotated, lbl, (poly[0][0], max(20, poly[0][1] - 8)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                else:
-                    cv2.polylines(annotated, [poly], True, (120, 120, 120), 1)
-
-            # HUD
-            fps = frame_count / max(1e-4, time.time() - t0)
-            cal_status = "CALIBRATED" if calibrated_ranges else "UNSET (Click on shirt)"
-            hud = f"FPS: {fps:.1f} | People: {len(detections)} | Shirts: {matched_count} | Color: {cal_status}"
-            cv2.rectangle(annotated, (6, 6), (620, 36), (20, 20, 20), -1)
-            cv2.putText(annotated, hud, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
-                        (0, 255, 0) if matched_count > 0 else (0, 220, 255), 1)
-
-            if args.headless:
-                if frame_count % 30 == 0 or matched_count > 0:
-                    print(f"[Frame {frame_count:04d}] People: {len(detections)}, Shirts: {matched_count} | {fps:.1f} FPS")
-            else:
-                cv2.imshow(window_name, annotated)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), 27):
-                    break
-                elif key == ord("r"):
-                    calibrator.reset()
-                    print("[Calibration] Reset samples.")
-                elif key == ord("s") and calibrated_ranges:
-                    save_calibration(calibrated_ranges, args.colour_file)
-
-            if args.max_frames and frame_count >= args.max_frames:
-                break
-
-    finally:
-        cam.close()
-        if not args.headless:
-            cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__':main()
