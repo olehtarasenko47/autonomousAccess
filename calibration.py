@@ -61,7 +61,7 @@ def load_profiles(node,root='calibrations'):
     for role in ROLES:
         path=profile_path(node,role,root)
         if not path.is_file():continue
-        data=json.loads(path.read_text(encoding='utf-8'))
+        data=json.loads(path.read_text(encoding='utf-8-sig'))
         if data.get('schema')!=SCHEMA or data.get('node')!=node or data.get('role')!=role:
             raise ValueError(f'{path}: wrong schema, node or role; recalibrate')
         profiles[role]=validate_ranges(data['hsv_ranges'])
