@@ -1,9 +1,11 @@
 """Independent durable event stores and authenticated UDP gossip; no leader.
-Only metadata travels between laptops. A shared key is required when peers are configured.
+Metadata travels between laptops; optional encrypted JPEG evidence is latest-only.
 """
 from __future__ import annotations
 import hashlib, hmac, json, math, os, socket, sqlite3, threading, time, uuid
 from pathlib import Path
+from fallback import Fallback, valid_snapshot
+from snapshots import PhotoCache, PhotoTransport
 
 NODES = {'node_1': ('A', 'public', 'camera1', '10.249.58.251'),
          'node_2': ('B', 'staff', 'camera3', '10.249.37.86'),
@@ -47,6 +49,8 @@ class State:
         self.db.execute('CREATE TABLE IF NOT EXISTS mutes (zone TEXT PRIMARY KEY, payload TEXT)')
         self.db.commit()
         self.camera = 'starting'; self.counts = {}; self.heard = {}
+        self.fallback=Fallback(self)
+        self.photos=PhotoCache(self)
 
     def add(self, e):
         if not valid_event(e): return False
@@ -87,18 +91,26 @@ class State:
     def mute_until(self, zone):
         return next((m['until'] for m in self.mutes() if m['zone']==zone),0)
 
-    def update(self, camera, counts=None):
-        with self.lock: self.camera, self.counts = camera, dict(counts or {})
+    def update(self, camera, counts=None, observed_at=None, violations=0):
+        with self.lock:
+            old=self.camera
+            self.camera=camera
+            if camera=='online':self.counts=dict(counts or {})
+            self.fallback.update(camera,self.counts,observed_at,violations)
+            self.fallback.camera_transition(old,camera)
 
     def heartbeat(self):
-        with self.lock: return dict(node=self.node,camera=self.camera,counts=self.counts)
+        with self.lock: return dict(node=self.node,camera=self.camera,counts=self.counts,snapshot=self.fallback.local_snapshot())
 
     def receive_heartbeat(self,p):
         try:
             n=p['node']; counts=p['counts']; cam=p['camera']
             if n not in NODES or n==self.node or cam not in ('starting','online','offline'):return
             if not isinstance(counts,dict) or any(k not in ROLES or type(v) is not int or not 0<=v<=1000 for k,v in counts.items()):return
-            with self.lock: self.heard[n]=(time.monotonic(),cam,dict(counts))
+            with self.lock:
+                self.heard[n]=(time.monotonic(),cam,dict(counts))
+                snap=p.get('snapshot')
+                if valid_snapshot(snap) and snap['node']==n and snap['camera']==cam:self.fallback.save_snapshot(snap)
         except (KeyError,TypeError,ValueError):pass
 
     def status_lines(self):
@@ -110,7 +122,7 @@ class State:
                     _,cam,counts=self.heard[n];peer='online'
                 else:cam,counts,peer='unknown',{},'offline'
                 rows.append(f'{n} / Zone {z}: peer {peer}, camera {cam}, visible {sum(counts.values()) if cam=="online" else "?"}')
-            return rows
+            return rows+self.fallback.lines()
 
     def online_count(self):
         with self.lock: return 1+sum(time.monotonic()-r[0]<5 for r in self.heard.values())
@@ -125,11 +137,13 @@ def target(s, port):
 
 
 class Peer:
-    def __init__(self,state,peers=(),port=PORT,key=None,deployment='durhack-access-v2'):
+    def __init__(self,state,peers=(),port=PORT,key=None,deployment='durhack-access-v2',snapshots=False):
         self.state=state;self.targets=[target(p,PORT) for p in peers];self.enabled=True
         if self.targets and not key:raise ValueError('Set ZONEGUARD_PEER_KEY to the same secret on all laptops')
         self.key=(key or '').encode();self.deployment=deployment;self.stop=threading.Event()
         self.sock=None;self.threads=[]
+        self.photos=PhotoTransport(self.key,state.photos) if snapshots and self.targets else None
+        self.photo_lock=threading.Lock();self.last_photo_send=0
         if self.targets:
             self.sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
             self.sock.bind(('',port));self.sock.settimeout(.2)
@@ -155,8 +169,22 @@ class Peer:
             try:self.sock.sendto(packet,dest)
             except OSError:pass
 
+    def send_latest_photo(self,force=False):
+        if not self.photos or not self.enabled:return
+        with self.photo_lock:
+            now=time.monotonic()
+            if not force and now-self.last_photo_send<2:return
+            photo=self.state.photos.get(self.state.node)
+            if photo:
+                for part in self.photos.packets(photo):self.send('photo',part)
+                self.last_photo_send=now
+
     def publish(self,event):
         if self.state.add(event):self.send('event',event);return True
+        return False
+
+    def publish_incident(self,event):
+        if self.state.fallback.add(event):self.send('incident',event);return True
         return False
 
     def mute(self,zone,until):self.send('mute',self.state.set_mute(zone,until))
@@ -180,13 +208,19 @@ class Peer:
                 if kind=='event':self.state.add(p)
                 elif kind=='mute':self.state.merge_mute(p)
                 elif kind=='hello':self.state.receive_heartbeat(p)
+                elif kind=='incident':self.state.fallback.add(p)
+                elif kind=='notice_queued':self.state.fallback.merge_notification_mark(p)
+                elif kind=='photo' and self.photos:self.photos.receive(p)
             except (KeyError,ValueError,TypeError,AttributeError):continue
 
     def _gossip(self):
         while not self.stop.is_set():
             self.send('hello',self.state.heartbeat())
+            self.send_latest_photo()
             if self.enabled:
                 for m in self.state.mutes():self.send('mute',m)
+                for e in self.state.fallback.incidents():self.send('incident',e)
+                for ident in self.state.fallback.notification_marks():self.send('notice_queued',ident)
                 for e in self.state.events():
                     if self.stop.is_set():break
                     self.send('event',e)

@@ -192,7 +192,7 @@ class TelegramAlerter:
     def queued(self):
         return len(list(self.outbox.glob("*.json")))
 
-    def intrusion(self, zone, frame=None, confidence=None, ts=None, note=None, force=False):
+    def intrusion(self, zone, frame=None, confidence=None, ts=None, note=None, force=False, bypass_cooldown=False):
         """
         Report someone in a restricted zone. Safe to call every frame: repeats
         within `cooldown` seconds and muted zones are ignored.
@@ -202,7 +202,7 @@ class TelegramAlerter:
         now = time.time()
         with self._lock:
             if not force and (self.is_muted(zone) or
-                              now - self._last_alert.get(zone, 0) < self.cooldown):
+                              (not bypass_cooldown and now - self._last_alert.get(zone, 0) < self.cooldown)):
                 return None
             self._last_alert[zone] = now
         aid = f"{self.node_id}-{uuid.uuid4().hex}"
@@ -222,9 +222,25 @@ class TelegramAlerter:
         self._wake.set()
         return aid
 
+    def incident(self, event_id, zone, kind, note, ts=None, jpeg=None):
+        """Queue durable operational/risk notification, separate from access cooldown."""
+        if kind == 'POTENTIAL_TRESPASSING' and self.is_muted(zone):return None
+        aid=f"{self.node_id}-health-{event_id}"
+        item={"id":aid,"zone":zone,"ts":ts or time.time(),"confidence":None,
+              "note":note,"photo":None,"done_chats":[],"kind":kind}
+        with self._lock:
+            path=self.outbox/f"{aid}.json"
+            if not path.exists():
+                if jpeg is not None and self.send_photos:
+                    photo=self.outbox/f'{aid}.jpg';photo.write_bytes(jpeg);item['photo']=str(photo)
+                tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(item));tmp.replace(path)
+        self._wake.set();return aid
+
     # ---------------------------------------------------------------- sending --
     def _format(self, item):
         t = datetime.fromtimestamp(item["ts"]).strftime("%H:%M:%S")
+        if item.get("kind"):
+            return "<b>ZoneGuard operational alert</b>\n"+html.escape(item.get("note") or item["kind"])
         lines = ["🚨 <b>Potential access violation</b>",
                  f"<b>Zone:</b> {html.escape(self.label(item['zone']))}",
                  f"<b>Camera:</b> {html.escape(self.node_id)}",
@@ -247,6 +263,7 @@ class TelegramAlerter:
     def _deliver(self, chat, item):
         params = {"chat_id": chat, "parse_mode": "HTML",
                   "reply_markup": self._buttons(item)}
+        if item.get("kind"):params.pop("reply_markup",None)
         photo = item.get("photo")
         if photo and Path(photo).exists():
             params["caption"] = self._format(item)

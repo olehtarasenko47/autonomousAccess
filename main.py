@@ -12,6 +12,8 @@ from peer_state import NODES, ROLES, LABELS, POLICY, State, Peer, PORT, new_even
 from torso import isolate_torso_mask
 from video_source import open_source, StreamSource
 from telegram_alerts import TelegramAlerter
+from fallback import utc
+from snapshots import evidence_for
 
 GREEN=(110,232,145); RED=(75,75,255); AMBER=(70,200,255); WHITE=(240,245,248)
 FONT=cv2.FONT_HERSHEY_SIMPLEX
@@ -82,7 +84,7 @@ def text(img,s,x,y,scale=.65,c=WHITE,thick=2):
     scale*=min(1,avail/max(1,tw));cv2.putText(img,s,(int(x),int(y)),FONT,scale,c,thick,cv2.LINE_AA)
 
 
-def render(frame,people,node,width,height,fps,cap,peers,events,missing,split=None,offline=False,telegram_status='off'):
+def render(frame,people,node,width,height,fps,cap,peers,events,missing,split=None,offline=False,telegram_status='off',risk=False,health_text=''):
     zone,mode,_,_=NODES[node];h0,w0=frame.shape[:2];hh,fh=50,87
     scale=min(width/w0,(height-hh-fh)/h0);w,h=max(1,round(w0*scale)),max(1,round(h0*scale))
     img=cv2.resize(frame,(w,h),interpolation=cv2.INTER_LINEAR if scale>1 else cv2.INTER_AREA)
@@ -102,19 +104,20 @@ def render(frame,people,node,width,height,fps,cap,peers,events,missing,split=Non
     allowed='EVERYONE' if mode=='public' else ', '.join(sorted(POLICY[mode])).upper()
     text(head,('LEFT PUBLIC / RIGHT: ' if split is not None else 'ALLOWED: ')+allowed,10,41,.53,WHITE,1)
     footer=np.full((fh,w,3),25,np.uint8);viol=sum(v=='violation' for _,_,v in people);reviews=sum(v in ('pending','review') for _,_,v in people)
-    if offline:footer[:]=(35,70,115);msg='CAMERA OFFLINE - reconnecting';col=WHITE
-    elif viol:footer[:]=(35,35,165);msg=f'ALERT: {viol} POTENTIAL ACCESS VIOLATION(S)';col=WHITE
+    if offline:footer[:]=(35,70,115);msg='CAMERA OFFLINE - last image is stale';col=WHITE
+    elif viol:footer[:]=(35,35,165);msg=f'TRESPASSING FLAG: {viol} - VERIFY ACCESS';col=WHITE
+    elif risk:footer[:]=(35,80,115);msg='POTENTIAL TRESPASSING - upstream alert';col=WHITE
     elif reviews:footer[:]=(35,80,115);msg=f'CHECK ACCESS: {reviews} person(s)';col=WHITE
     else:msg='ALL CLEAR' if mode!='public' else 'PUBLIC - EVERYONE ALLOWED';col=GREEN
     text(footer,msg,10,25,.72,col)
     text(footer,f'People {len(people) if not offline else 0} | AI {fps:.1f} FPS | Camera {cap:.1f} | Nodes {peers}/3 | Events {events}',10,48,.56,WHITE,1)
-    text(footer,('CALIBRATE: '+', '.join(missing) if missing else 'All four roles calibrated')+f' | Telegram {telegram_status}',10,72,.54,WHITE,1)
+    text(footer,health_text or (('CALIBRATE: '+', '.join(missing) if missing else 'All four roles calibrated')+f' | Telegram {telegram_status}'),10,72,.54,WHITE,1)
     return np.vstack((head,img,footer))
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--node',required=True,choices=NODES);p.add_argument('--source');p.add_argument('--profile-dir',default='calibrations');p.add_argument('--model',default='yolo11n-pose.pt');p.add_argument('--imgsz',type=int,default=640);p.add_argument('--device');p.add_argument('--width',type=int,default=1400);p.add_argument('--height',type=int,default=900);p.add_argument('--split',type=float,help='Optional test: left public, right monitored zone');p.add_argument('--peer',action='append',default=[],help='Other LAPTOP IP (or IP:port), repeat twice');p.add_argument('--port',type=int,default=PORT);p.add_argument('--deployment',default='durhack-access-v2');p.add_argument('--db');p.add_argument('--telegram',action='store_true');p.add_argument('--telegram-photos',action='store_true',help='Only with organiser approval');p.add_argument('--cooldown',type=float,default=60);p.add_argument('--headless',action='store_true');p.add_argument('--max-frames',type=int,default=0);a=p.parse_args()
-    if a.width<400 or a.height<350 or (a.split is not None and not .1<=a.split<=.9) or a.cooldown<1:p.error('Invalid dimensions, split or cooldown')
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--node',required=True,choices=NODES);p.add_argument('--source');p.add_argument('--profile-dir',default='calibrations');p.add_argument('--model',default='yolo11n-pose.pt');p.add_argument('--imgsz',type=int,default=640);p.add_argument('--device');p.add_argument('--width',type=int,default=1400);p.add_argument('--height',type=int,default=900);p.add_argument('--split',type=float,help='Optional test: left public, right monitored zone');p.add_argument('--peer',action='append',default=[],help='Other LAPTOP IP (or IP:port), repeat twice');p.add_argument('--port',type=int,default=PORT);p.add_argument('--deployment',default='durhack-access-v2');p.add_argument('--db');p.add_argument('--telegram',action='store_true');p.add_argument('--telegram-photos',action='store_true',help='With organiser approval: Telegram photos and encrypted peer stills');p.add_argument('--status-interval',type=float,default=10,help='Automatic terminal status seconds; 0 disables periodic reports');p.add_argument('--cooldown',type=float,default=60);p.add_argument('--risk-window',type=float,default=120,help='Compatibility option: 0 disables advisory; positive values enable recovery-based risk (no expiry)');p.add_argument('--headless',action='store_true');p.add_argument('--max-frames',type=int,default=0);a=p.parse_args()
+    if a.width<400 or a.height<350 or (a.split is not None and not .1<=a.split<=.9) or a.cooldown<1 or a.risk_window<0 or a.status_interval<0:p.error('Invalid dimensions, split or cooldown')
     if a.peer and not os.getenv('ZONEGUARD_PEER_KEY'):p.error('Set ZONEGUARD_PEER_KEY on all laptops before using --peer')
     if a.telegram_photos and not a.telegram:p.error('--telegram-photos requires --telegram')
     zone,mode,_,_=NODES[a.node]
@@ -129,32 +132,89 @@ def main():
     window=f'ZoneGuard | {a.node} | Zone {zone} - {LABELS[zone]}'
     try:
         state=State(a.node,a.db or str(Path('runtime')/a.deployment/(a.node+'.sqlite3')))
-        peer=Peer(state,a.peer,a.port,os.getenv('ZONEGUARD_PEER_KEY'),a.deployment)
+        peer=Peer(state,a.peer,a.port,os.getenv('ZONEGUARD_PEER_KEY'),a.deployment,snapshots=a.telegram_photos)
         if a.telegram:
             bot=TelegramAlerter.from_env(a.node,zone_labels={z:f'Zone {z} - {label}' for z,label in LABELS.items()},cooldown=a.cooldown,send_photos=a.telegram_photos,status_fn=lambda:state.status_lines()+[f'Replicated events: {state.event_count()}'],on_mute=peer.mute)
             bot.start()
         if not a.headless:cv2.namedWindow(window,cv2.WINDOW_AUTOSIZE)
-        gate=Gate();times=deque(maxlen=30);last_at=None;last_frame=None;last_gen=None;frames=0;offline=False;last_mute=None
+        gate=Gate();times=deque(maxlen=30);last_at=None;last_frame=None;last_gen=None;frames=0;offline=False;last_mute=None;started=time.monotonic();last_preview=None;last_image_ts=None;last_photo_capture=0
         print(f'[access] {a.node}: Zone {zone} {mode}, allowed {sorted(POLICY[mode])}; {len(a.peer)} configured peers',flush=True)
         def keys():
             if a.headless:return False
             key=cv2.waitKey(1)&255
             if key in (ord('q'),27):return True
-            if key==ord('c'):peer.enabled=not peer.enabled;print('[peer]', 'enabled' if peer.enabled else 'paused',flush=True)
-            if key==ord('p'):print('\n'.join(state.status_lines()),flush=True)
+            if key==ord('c'):
+                if peer.enabled:
+                    if a.telegram_photos and last_preview is not None:
+                        state.photos.capture(a.node,last_image_ts,last_preview)
+                    peer.send_latest_photo(force=True)
+                    peer.send('hello',state.heartbeat())
+                    peer.enabled=False
+                else:
+                    peer.enabled=True;peer.send('hello',state.heartbeat());peer.send_latest_photo(force=True)
+                print('[peer]', 'enabled' if peer.enabled else 'paused (last observation sent; local monitoring continues)',flush=True)
+                print_status(force=True)
+            if key==ord('p'):print_status(force=True)
             try:return cv2.getWindowProperty(window,cv2.WND_PROP_VISIBLE)<1
             except cv2.error:return True
         def bot_status():return 'off' if not bot else f'queued {bot.queued()}'
+        last_health=0;last_status=0;last_status_key=None
+        def print_status(force=False):
+            nonlocal last_status,last_status_key
+            now=time.monotonic();key=[]
+            for n in NODES:
+                snap=state.fallback.local_snapshot() if n==state.node else state.fallback.snapshot(n)
+                key.append((n,state.fallback.online(n),snap['camera'] if snap else 'unknown',bool(snap and snap['violations']),state.fallback.risk(n)))
+            key=(peer.enabled,tuple(key))
+            if force or key!=last_status_key or (a.status_interval and now-last_status>=a.status_interval):
+                print('[status] '+utc(time.time())+'\n'+'\n'.join(state.status_lines()),flush=True)
+                last_status=now;last_status_key=key
+        seen_health={e['id'] for e in state.fallback.incidents()}
+        def health_text():
+            parts=[]
+            if offline:parts.append('Last observed: '+utc(state.fallback.last_seen)+' | '+str(state.fallback.counts)+f' | Trespassing: {bool(state.fallback.violations)}')
+            if state.fallback.down:parts.append('Unreachable: '+', '.join(sorted(state.fallback.down)))
+            if state.fallback.risk():parts.append('Potential trespassing risk')
+            return ' | '.join(parts)
+        def health():
+            nonlocal last_health
+            now=time.monotonic()
+            if now-last_health<.5:return
+            last_health=now
+            state.fallback.tick(peer,a.risk_window)
+            print_status()
+            # Queue only the originating reporter's incident, not its replicated copies.
+            for incident in state.fallback.incidents():
+                if incident['id'] not in seen_health:
+                    seen_health.add(incident['id']);print('[fallback]',state.fallback.notice(incident),flush=True)
+                if not state.fallback.notification_owner(incident) or state.fallback.notified(incident['id']):continue
+                if not bot:continue
+                if incident['kind']=='POTENTIAL_TRESPASSING' and not state.fallback.risk_incident_active(incident):
+                    state.fallback.mark_notified(incident['id']);continue
+                bot.mute_until(incident['zone'],state.mute_until(incident['zone']))
+                try:
+                    note=state.fallback.notice(incident);photo=evidence_for(state,incident) if a.telegram_photos else None
+                    if a.telegram_photos and incident['kind'] in ('CAMERA_OFFLINE','NODE_UNREACHABLE','POTENTIAL_TRESPASSING'):
+                        note+=f'\nLast available image: {photo.node} at {utc(photo.ts)} (STALE, not live).' if photo else '\nNo cached image available for this observation.'
+                    bot.incident(incident['id'],incident['zone'],incident['kind'],note,incident['ts'],jpeg=photo.jpeg if photo else None)
+                    state.fallback.mark_notified(incident['id']);peer.send('notice_queued',incident['id'])
+                except OSError as exc:print('[fallback] queue error:',type(exc).__name__,flush=True)
         while True:
             if bot:
                 until=state.mute_until(zone)
                 if until!=last_mute:bot.mute_until(zone,until);last_mute=until
+            health()
             frame,ts=src.read();now=time.monotonic()
             if frame is None:
                 if not isinstance(src,StreamSource):break
-                if last_at is None or now-last_at>1.0:
-                    if not offline:gate.clear();state.update('offline');offline=True
-                    if not a.headless:cv2.imshow(window,render(last_frame if last_frame is not None else np.zeros((480,640,3),np.uint8),[],a.node,a.width,a.height,0,0,state.online_count(),state.event_count(),missing,a.split,True,bot_status()))
+                if (last_at is None and now-started>5) or (last_at is not None and now-last_at>1.0):
+                    if not offline:
+                        if a.telegram_photos and last_preview is not None:
+                            state.photos.capture(a.node,last_image_ts,last_preview);peer.send_latest_photo(force=True)
+                        gate.clear();state.update('offline');peer.send('hello',state.heartbeat());offline=True;health()
+                    if not a.headless:cv2.imshow(window,render(last_frame if last_frame is not None else np.zeros((480,640,3),np.uint8),[],a.node,a.width,a.height,0,0,state.online_count(),state.event_count(),missing,a.split,True,bot_status(),state.fallback.risk(),health_text()))
+                elif last_frame is None and not a.headless:
+                    cv2.imshow(window,render(np.zeros((480,640,3),np.uint8),[],a.node,a.width,a.height,0,0,state.online_count(),state.event_count(),missing,a.split,True,bot_status(),False,'Waiting for initial camera connection'))
                 if keys():break
                 continue
             gen=getattr(src,'last_generation',0)
@@ -179,21 +239,30 @@ def main():
                     if inside:counts[shirt.role if verdict!='pending' else 'hacker']+=1
                     people.append((box,shirt,verdict))
                     if emit:pending_events.append(new_event(a.node,shirt.role,shirt.colour,verdict,int(ids[i]),shirt.score,ts))
-            state.update('online',counts);times.append(time.monotonic());fps=(len(times)-1)/max(.001,times[-1]-times[0]) if len(times)>1 else 0
-            preview=render(frame,people,a.node,a.width,a.height,fps,getattr(src,'capture_fps',0),state.online_count(),state.event_count(),missing,a.split,False,bot_status()) if not a.headless or a.telegram_photos else None
+            state.update('online',counts,ts,sum(v=='violation' for _,_,v in people));times.append(time.monotonic());fps=(len(times)-1)/max(.001,times[-1]-times[0]) if len(times)>1 else 0
+            preview=render(frame,people,a.node,a.width,a.height,fps,getattr(src,'capture_fps',0),state.online_count(),state.event_count(),missing,a.split,False,bot_status(),state.fallback.risk(),health_text()) if not a.headless or a.telegram_photos else None
+            if a.telegram_photos and preview is not None:
+                last_preview=preview;last_image_ts=ts
+                if now-last_photo_capture>=2 or any(e['decision']=='violation' for e in pending_events):
+                    state.photos.capture(a.node,ts,preview);last_photo_capture=now
+                    if any(e['decision']=='violation' for e in pending_events):
+                        peer.send('hello',state.heartbeat());peer.send_latest_photo(force=True)
             for event in pending_events:
                 if not peer.publish(event):continue
                 print(f"[access] Zone {zone}: {event['role']} ({event['shirt']}) -> {event['decision']} | {event['id']}",flush=True)
                 if bot and event['decision']=='violation':
-                    try:bot.intrusion(zone,frame=preview if a.telegram_photos else None,ts=event['ts'],note=f"Detected role: {event['role']}; shirt: {event['shirt']}. Please verify in person. Event: {event['id']}")
+                    try:bot.intrusion(zone,frame=preview if a.telegram_photos else None,ts=event['ts'],note=f"Detected role: {event['role']}; shirt: {event['shirt']}. Please verify in person. Event: {event['id']}",bypass_cooldown=True)
                     except (OSError,ValueError,cv2.error) as e:print('[telegram] could not queue alert:',type(e).__name__,flush=True)
+            health()
             if not a.headless:cv2.imshow(window,preview)
             if keys() or (a.max_frames and frames>=a.max_frames):break
     except KeyboardInterrupt:pass
     finally:
         if bot:bot.stop()
         if peer:peer.close()
-        if state:state.close()
+        if state:
+            state.fallback.save_snapshot(state.fallback.local_snapshot())
+            state.close()
         src.close();cv2.destroyAllWindows()
 
 if __name__=='__main__':main()
