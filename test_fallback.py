@@ -107,8 +107,14 @@ class FallbackTests(unittest.TestCase):
                 self.assertEqual(down[0]['snapshot']['last_seen'],ts);self.assertEqual(down[0]['snapshot']['violations'],1)
                 self.assertTrue(eventually(lambda:any(e['kind']=='NODE_UNREACHABLE' for e in ss[2].fallback.incidents())))
                 pp[1].enabled=True;ss[1].update('online',{},time.time(),0)
-                self.assertTrue(eventually(lambda:ss[0].online_count()==3));ss[0].fallback.tick(pp[0]);
-                self.assertTrue(eventually(lambda:any(e['kind']=='NODE_RECOVERED' for e in ss[2].fallback.incidents())))
+                self.assertTrue(eventually(lambda:ss[0].online_count()==3))
+                # The production loop ticks continuously; a single tick can be
+                # skipped by the 250 ms throttle if reconnection was fast.
+                def recovery_replicated():
+                    ss[0].fallback.tick(pp[0])
+                    ss[2].fallback.tick(pp[2])
+                    return any(e['kind']=='NODE_RECOVERED' for e in ss[2].fallback.incidents())
+                self.assertTrue(eventually(recovery_replicated, 10))
                 self.assertTrue(eventually(lambda:not any(s.fallback.risk('node_3') for s in ss)))
             finally:
                 for p in pp:p.close()

@@ -12,7 +12,7 @@ from peer_state import NODES, ROLES, LABELS, POLICY, State, Peer, PORT, new_even
 from torso import isolate_torso_mask
 from video_source import open_source, StreamSource
 from telegram_alerts import TelegramAlerter
-from fallback import utc
+from fallback import utc, CameraHealth
 from snapshots import evidence_for
 
 GREEN=(110,232,145); RED=(75,75,255); AMBER=(70,200,255); WHITE=(240,245,248)
@@ -137,7 +137,7 @@ def main():
             bot=TelegramAlerter.from_env(a.node,zone_labels={z:f'Zone {z} - {label}' for z,label in LABELS.items()},cooldown=a.cooldown,send_photos=a.telegram_photos,status_fn=lambda:state.status_lines()+[f'Replicated events: {state.event_count()}'],on_mute=peer.mute)
             bot.start()
         if not a.headless:cv2.namedWindow(window,cv2.WINDOW_AUTOSIZE)
-        gate=Gate();times=deque(maxlen=30);last_at=None;last_frame=None;last_gen=None;frames=0;offline=False;last_mute=None;started=time.monotonic();last_preview=None;last_image_ts=None;last_photo_capture=0
+        gate=Gate();times=deque(maxlen=30);last_at=None;last_frame=None;last_gen=None;frames=0;offline=False;last_mute=None;started=time.monotonic();last_preview=None;last_image_ts=None;last_photo_capture=0;camera_health=CameraHealth(started)
         print(f'[access] {a.node}: Zone {zone} {mode}, allowed {sorted(POLICY[mode])}; {len(a.peer)} configured peers',flush=True)
         def keys():
             if a.headless:return False
@@ -188,16 +188,18 @@ def main():
                 if incident['id'] not in seen_health:
                     seen_health.add(incident['id']);print('[fallback]',state.fallback.notice(incident),flush=True)
                 if not state.fallback.notification_owner(incident) or state.fallback.notified(incident['id']):continue
+                if incident['kind']=='POTENTIAL_TRESPASSING' and not peer.enabled and a.peer:continue
                 if not bot:continue
                 if incident['kind']=='POTENTIAL_TRESPASSING' and not state.fallback.risk_incident_active(incident):
-                    state.fallback.mark_notified(incident['id']);continue
+                    continue  # Inactive locally is not a delivery receipt.
                 bot.mute_until(incident['zone'],state.mute_until(incident['zone']))
                 try:
                     note=state.fallback.notice(incident);photo=evidence_for(state,incident) if a.telegram_photos else None
                     if a.telegram_photos and incident['kind'] in ('CAMERA_OFFLINE','NODE_UNREACHABLE','POTENTIAL_TRESPASSING'):
                         note+=f'\nLast available image: {photo.node} at {utc(photo.ts)} (STALE, not live).' if photo else '\nNo cached image available for this observation.'
-                    bot.incident(incident['id'],incident['zone'],incident['kind'],note,incident['ts'],jpeg=photo.jpeg if photo else None)
-                    state.fallback.mark_notified(incident['id']);peer.send('notice_queued',incident['id'])
+                    queued=bot.incident(incident['id'],incident['zone'],incident['kind'],note,incident['ts'],jpeg=photo.jpeg if photo else None)
+                    if queued:
+                        state.fallback.mark_notified(incident['id']);peer.send('notice_queued',incident['id'])
                 except OSError as exc:print('[fallback] queue error:',type(exc).__name__,flush=True)
         while True:
             if bot:
@@ -207,8 +209,9 @@ def main():
             frame,ts=src.read();now=time.monotonic()
             if frame is None:
                 if not isinstance(src,StreamSource):break
-                if (last_at is None and now-started>5) or (last_at is not None and now-last_at>1.0):
-                    if not offline:
+                lost=camera_health.missing(now)
+                if camera_health.offline:
+                    if lost:
                         if a.telegram_photos and last_preview is not None:
                             state.photos.capture(a.node,last_image_ts,last_preview);peer.send_latest_photo(force=True)
                         gate.clear();state.update('offline');peer.send('hello',state.heartbeat());offline=True;health()
@@ -218,6 +221,11 @@ def main():
                 if keys():break
                 continue
             gen=getattr(src,'last_generation',0)
+            if not camera_health.frame(now,gen):
+                if not a.headless:
+                    cv2.imshow(window,render(last_frame if last_frame is not None else np.zeros((480,640,3),np.uint8),[],a.node,a.width,a.height,0,0,state.online_count(),state.event_count(),missing,a.split,True,bot_status(),state.fallback.risk(),'Camera reconnecting - waiting for stable frames'))
+                if keys():break
+                continue
             if last_gen!=gen or offline:
                 gate.clear();times.clear()
                 for tracker in getattr(getattr(model,'predictor',None),'trackers',[]):

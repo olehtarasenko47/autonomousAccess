@@ -9,6 +9,33 @@ ROLES=('hacker','volunteer','mentor','organiser')
 KINDS=('CAMERA_OFFLINE','CAMERA_RECOVERED','NODE_UNREACHABLE','NODE_RECOVERED','POTENTIAL_TRESPASSING')
 TIMEOUT=5.0
 
+class CameraHealth:
+    """Debounce outages and require sustained frames before recovery."""
+    def __init__(self, now):
+        self.started=now;self.last_frame=None;self.offline=False
+        self.recovery_start=None;self.recovery_frames=0;self.generation=None
+    def missing(self, now):
+        if self.offline:
+            if self.last_frame is None or now-self.last_frame>1.0:
+                self.recovery_start=None;self.recovery_frames=0
+            return False
+        limit=5. if self.last_frame is None else 3.
+        if now-(self.started if self.last_frame is None else self.last_frame)>=limit:
+            self.offline=True;self.recovery_start=None;self.recovery_frames=0
+            return True
+        return False
+    def frame(self, now, generation=0):
+        if self.offline:
+            if (self.recovery_start is None or self.last_frame is None or
+                    now-self.last_frame>1.0 or generation!=self.generation):
+                self.recovery_start=now;self.recovery_frames=0
+            self.recovery_frames+=1
+            if self.recovery_frames>=3 and now-self.recovery_start>=2.0:
+                self.offline=False;self.recovery_start=None;self.recovery_frames=0
+        self.last_frame=now;self.generation=generation
+        return not self.offline
+
+
 def utc(ts):
     return datetime.fromtimestamp(ts,timezone.utc).isoformat(timespec='seconds') if ts else 'no observation yet'
 
@@ -150,7 +177,7 @@ class Fallback:
         if snap:
             source=f"node_2:{snap['session']}:{snap['last_seen']:.6f}"
             risk=incident('POTENTIAL_TRESPASSING','node_3','node_2',None,snap['last_seen'],source,0)
-            risk['id']=hashlib.sha256(('fallback-risk:'+source).encode()).hexdigest()[:32]
+            risk['id']=hashlib.sha256(('fallback-risk-v2:'+source).encode()).hexdigest()[:32]
             peer.publish_incident(risk)
 
     def upstream_risk_snapshot(self):
@@ -158,7 +185,11 @@ class Fallback:
         subject='node_2'
         with self.s.lock:
             snap=self.local_snapshot() if subject==self.s.node else self.snapshot(subject)
-            if not snap or not snap['violations'] or not snap['last_seen']:return None
+            if not snap or not snap['last_seen']:return None
+            # A short run of missed/uncertain detections must not erase a
+            # just-observed violation immediately before monitoring is lost.
+            if not snap['violations'] and not (snap['last_violation'] and 0<=snap['last_seen']-snap['last_violation']<=2.):return None
+            if subject!=self.s.node and subject not in self.s.heard and time.monotonic()-self.started<15:return None
             if not self.online(subject) or snap['camera']!='online':return snap
             # A reconnect with an old snapshot is not proof monitoring recovered.
             # Require a strictly newer processed frame than the last outage baseline.
@@ -174,18 +205,20 @@ class Fallback:
     def risk_incident_active(self,e):
         snap=self.upstream_risk_snapshot()
         return (e['kind']=='POTENTIAL_TRESPASSING' and e['expires']==0 and snap is not None
-                and e['source']==f"node_2:{snap['session']}:{snap['last_seen']:.6f}")
+                and e['source']==f"node_2:{snap['session']}:{snap['last_seen']:.6f}"
+                and e['id']==hashlib.sha256(('fallback-risk-v2:'+e['source']).encode()).hexdigest()[:32])
 
     def notification_owner(self,e):
-        if e['reporter']==self.s.node:return True
-        # The risk event is derived by all nodes. If the originating node goes
-        # away before marking its notification queued, a surviving witness can send.
-        if e['kind']!='POTENTIAL_TRESPASSING' or e['reporter'] not in self.down:return False
-        candidates=[n for n in NAMES if n!=e['reporter']]
-        preferred=candidates[0]
-        if self.s.node==preferred:return True
-        with self.s.lock:heard=self.s.heard.get(preferred)
-        return preferred in self.down and time.monotonic()-(heard[0] if heard else self.started)>=9
+        if e['kind']!='POTENTIAL_TRESPASSING':return e['reporter']==self.s.node
+        # B reports its own camera outage while reachable. Otherwise A takes
+        # over, with C as a backup. Use heartbeat age, not the reporting set.
+        if self.s.node=='node_2':return True
+        if self.online('node_2'):return False
+        now=time.monotonic()
+        with self.s.lock:source=self.s.heard.get('node_2');preferred=self.s.heard.get('node_1')
+        if source is None and now-self.started<15:return False
+        if self.s.node=='node_1':return True
+        return not self.online('node_1') and now-(preferred[0] if preferred else self.started)>=9
 
     def lines(self):
         rows=[]
@@ -200,7 +233,7 @@ class Fallback:
         snap=e['snapshot'];s=f"{e['kind']} | {e['subject']} | Zone {e['zone']} | {utc(e['ts'])}"
         if snap:s+=f"\nLast observation: {utc(snap['last_seen'])}\nLast known counts: {snap['counts']}\nLast known TRESPASSING: {'YES' if snap['violations'] else 'NO'}\nLast violation: {utc(snap['last_violation'])}"
         else:s+='\nNo last observation available.' if e['kind']!='POTENTIAL_TRESPASSING' else ''
-        if e['kind']=='POTENTIAL_TRESPASSING':s+=f"\nZone B monitoring unavailable; last observation contained a confirmed colour-based policy violation. Zone C may be at risk; no person identified or entry confirmed. Advisory clears when Zone B resumes fresh camera observations (no expiry)."
+        if e['kind']=='POTENTIAL_TRESPASSING':s+=f"\nZone B monitoring unavailable; a confirmed colour-based policy violation was observed at or shortly before the last observation. Zone C may be at risk; no person identified or entry confirmed. Advisory clears when Zone B resumes fresh camera observations (no expiry)."
         if e['kind']=='NODE_UNREACHABLE':s+='\nHeartbeat missing; power failure or network partition cannot be distinguished.'
         if e['kind'] in ('CAMERA_OFFLINE','NODE_UNREACHABLE'):s+='\nLast observations are stale, not a live count.'
         return s

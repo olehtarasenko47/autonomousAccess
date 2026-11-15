@@ -126,6 +126,7 @@ class TelegramAlerter:
         self.status_fn, self.late_after, self.log = status_fn, late_after, log
         self.outbox = Path(outbox_dir) / node_id
         (self.outbox / "failed").mkdir(parents=True, exist_ok=True)
+        (self.outbox / "sent").mkdir(parents=True, exist_ok=True)
 
         self.online = None                # None = unknown yet
         self.offline_since = None
@@ -230,7 +231,7 @@ class TelegramAlerter:
               "note":note,"photo":None,"done_chats":[],"kind":kind}
         with self._lock:
             path=self.outbox/f"{aid}.json"
-            if not path.exists():
+            if not path.exists() and not (self.outbox / "sent" / aid).exists():
                 if jpeg is not None and self.send_photos:
                     photo=self.outbox/f'{aid}.jpg';photo.write_bytes(jpeg);item['photo']=str(photo)
                 tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(item));tmp.replace(path)
@@ -316,7 +317,13 @@ class TelegramAlerter:
                     tmp.write_text(json.dumps(item))
                     tmp.replace(path)
                 self._set_online(True)
-                path.unlink()
+                if item.get("kind"):
+                    # Keep durable receipts even after the queue file is gone.
+                    with self._lock:
+                        (self.outbox / "sent" / item["id"]).touch()
+                        path.unlink()
+                else:
+                    path.unlink()
                 if item.get("photo"):
                     Path(item["photo"]).unlink(missing_ok=True)
                 self.sent += 1
