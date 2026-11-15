@@ -1,201 +1,134 @@
 #!/usr/bin/env python3
-"""
-Shirt Color Click Calibration.
-
-Handles click-sampling on shirt fabric, HSV percentile range calculation
-with hue wrap-around support, and loading/saving to colour.json.
-Can be imported as a module or executed standalone to calibrate from camera:
-  python3 calibration.py --phone-ip 192.168.1.15 --app droidcam
-"""
-
+"""Fresh, per-node, per-role HSV calibration. No preset or legacy colour files used."""
 from __future__ import annotations
-
-import argparse
-import json
+import argparse, getpass, json, os
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
-
+from urllib.parse import quote
 import cv2
 import numpy as np
+from peer_state import NODES, ROLES
+from video_source import open_source, StreamSource
+
+SCHEMA='access-role-hsv-v1'
 
 
-class ClickCalibrator:
-    """Manages click-sampling and HSV calibration on live frames."""
-
-    def __init__(self, patch_radius: int = 4, margin_h: int = 6, margin_sv: int = 30) -> None:
-        self.patch_radius = patch_radius
-        self.margin_h = margin_h
-        self.margin_sv = margin_sv
-        self.samples: List[List[int]] = []
-
-    def add_click(self, frame: np.ndarray, x: int, y: int) -> int:
-        """Samples patch around (x, y) and stores HSV pixels."""
-        h, w = frame.shape[:2]
-        r = self.patch_radius
-        patch = frame[max(0, y - r):min(h, y + r + 1), max(0, x - r):min(w, x + r + 1)]
-        hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV).reshape(-1, 3)
-        self.samples.extend(hsv_patch.tolist())
-        return len(hsv_patch)
-
-    def compute_ranges(self) -> Optional[List[Tuple[np.ndarray, np.ndarray]]]:
-        """Calculates 3rd-97th percentile HSV bounds with hue wrap-around."""
-        px = np.asarray(self.samples, dtype=np.int32)
-        if len(px) == 0:
-            return None
-
-        # Filter extreme shadows / unsaturated pixels
-        valid = px[(px[:, 1] >= 50) & (px[:, 2] >= 40)]
-        if len(valid) < 10:
-            return None
-
-        h, s, v = valid[:, 0], valid[:, 1], valid[:, 2]
-        spread = np.percentile(h, 97) - np.percentile(h, 3)
-        rotated = (h + 90) % 180
-        spread_rot = np.percentile(rotated, 97) - np.percentile(rotated, 3)
-
-        s_lo = max(50, int(np.percentile(s, 3)) - self.margin_sv)
-        v_lo = max(40, int(np.percentile(v, 3)) - self.margin_sv)
-
-        if spread_rot < spread:
-            # Hue wraps around 0/180 (e.g. red)
-            lo = (int(np.percentile(rotated, 3)) - self.margin_h - 90) % 180
-            hi = (int(np.percentile(rotated, 97)) + self.margin_h - 90) % 180
-            return [
-                (np.array([lo, s_lo, v_lo], dtype=np.uint8), np.array([179, 255, 255], dtype=np.uint8)),
-                (np.array([0, s_lo, v_lo], dtype=np.uint8), np.array([hi, 255, 255], dtype=np.uint8)),
-            ]
-        else:
-            h_lo = max(0, int(np.percentile(h, 3)) - self.margin_h)
-            h_hi = min(179, int(np.percentile(h, 97)) + self.margin_h)
-            return [(np.array([h_lo, s_lo, v_lo], dtype=np.uint8), np.array([h_hi, 255, 255], dtype=np.uint8))]
-
-    def reset(self) -> None:
-        self.samples.clear()
-
-    @property
-    def total_samples(self) -> int:
-        return len(self.samples)
+def source_for(node, explicit=None):
+    if explicit: return explicit
+    _,_,user,ip=NODES[node]
+    password=os.environ.get('CAMERA_PASSWORD') or getpass.getpass(f'{user} camera password: ')
+    return f'http://{user}:{quote(password,safe="")}@{ip}:8080/mjpeg'
 
 
-def load_calibration(path: str = "colour.json") -> Optional[List[Tuple[np.ndarray, np.ndarray]]]:
-    """Loads calibrated HSV ranges from JSON file. Returns None if not found."""
-    p = Path(path)
-    if not p.is_file():
-        return None
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        ranges = []
-        for item in data.get("hsv_ranges", []):
-            if len(item) == 2:
-                ranges.append((np.array(item[0], dtype=np.uint8), np.array(item[1], dtype=np.uint8)))
-        return ranges if ranges else None
-    except Exception as e:
-        print(f"[Calibration] Could not load {path}: {e}")
-        return None
+def profile_path(node,role,root='calibrations'):
+    return Path(root)/node/(role+'.json')
 
 
-def save_calibration(ranges: List[Tuple[np.ndarray, np.ndarray]], path: str = "colour.json", name: str = "calibrated_shirt") -> None:
-    data = {
-        "name": name,
-        "hsv_ranges": [[lo.tolist(), hi.tolist()] for lo, hi in ranges],
-    }
-    Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
-    print(f"[Calibration] Saved to {path}")
+def ranges_from_samples(samples):
+    if len(samples)<5:raise ValueError('Take at least five separate fabric samples')
+    px=np.concatenate(samples,axis=0).astype(float)
+    px=px[(px[:,1]>=50)&(px[:,2]>=40)]
+    if len(px)<50:raise ValueError('Not enough saturated fabric pixels')
+    angle=px[:,0]*2*np.pi/180
+    z=np.mean(np.exp(1j*angle))
+    if abs(z)<.75:raise ValueError('Mixed colours sampled; reset and sample one shirt')
+    center=np.angle(z)*180/(2*np.pi)%180
+    delta=(px[:,0]-center+90)%180-90
+    lo,hi=np.percentile(delta,[3,97]);lo=int(np.floor(center+lo-5));hi=int(np.ceil(center+hi+5))
+    if hi-lo>36:raise ValueError('Hue range too broad; reset and sample one colour only')
+    sl=max(50,int(np.percentile(px[:,1],3))-25)
+    vl=max(40,int(np.percentile(px[:,2],3))-30)
+    start,end=lo%180,hi%180
+    if start<=end:return [[[start,sl,vl],[end,255,255]]]
+    return [[[start,sl,vl],[179,255,255]],[[0,sl,vl],[end,255,255]]]
 
 
-# ------------------------------------------------------------- Standalone CLI ---
+def validate_ranges(ranges):
+    if not isinstance(ranges,list) or not 1<=len(ranges)<=2:raise ValueError('Expected one or two HSV intervals')
+    total=0
+    for pair in ranges:
+        if not isinstance(pair,list) or len(pair)!=2:raise ValueError('Invalid HSV interval')
+        lo,hi=pair
+        if not all(isinstance(v,list) and len(v)==3 for v in (lo,hi)):raise ValueError('Invalid HSV triple')
+        if not all(type(a) is int and type(b) is int and 0<=a<=b<=m for a,b,m in zip(lo,hi,(179,255,255))):raise ValueError('Invalid HSV bounds')
+        if lo[1]<50 or lo[2]<40:raise ValueError('Profile includes unsaturated/dark pixels')
+        total+=hi[0]-lo[0]+1
+    if total>37:raise ValueError('HSV hue span too broad')
+    return ranges
 
-def main() -> None:
-    from phone_stream import PhoneStream
 
-    parser = argparse.ArgumentParser(description="Standalone Shirt Color Click Calibrator")
-    parser.add_argument("--source", default=None, help="Phone stream URL, device index (0), or image file")
-    parser.add_argument("--phone-ip", default=None, help="Phone IP address (paired with --app)")
-    parser.add_argument("--app", default="droidcam", choices=["droidcam", "ipwebcam"], help="Phone streaming app")
-    parser.add_argument("--out", default="colour.json", help="Path to save calibrated ranges")
-    parser.add_argument("--name", default="calibrated_shirt", help="Name label for calibrated shirt")
-    args = parser.parse_args()
+def load_profiles(node,root='calibrations'):
+    profiles={}
+    for role in ROLES:
+        path=profile_path(node,role,root)
+        if not path.is_file():continue
+        data=json.loads(path.read_text(encoding='utf-8'))
+        if data.get('schema')!=SCHEMA or data.get('node')!=node or data.get('role')!=role:
+            raise ValueError(f'{path}: wrong schema, node or role; recalibrate')
+        profiles[role]=validate_ranges(data['hsv_ranges'])
+    return profiles
 
-    if args.phone_ip:
-        port = 4747 if args.app == "droidcam" else 8080
-        source = f"http://{args.phone_ip}:{port}/video"
-    elif args.source:
-        source = args.source
-    else:
-        source = "http://127.0.0.1:4747/video"
 
-    print(f"[Calibration] Connecting to: {source}")
-    cam = PhoneStream(source)
-    calibrator = ClickCalibrator()
-    show_mask = False
-    window_name = "Calibrate Shirt (Click: Sample | m: Mask | s: Save | r: Reset | q: Quit)"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+def save_profile(node,role,samples,root='calibrations'):
+    ranges=validate_ranges(ranges_from_samples(samples));path=profile_path(node,role,root)
+    path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(dict(schema=SCHEMA,node=node,role=role,hsv_ranges=ranges),indent=2),encoding='utf-8');tmp.replace(path)
+    return path,ranges
 
-    current_frame: Optional[np.ndarray] = None
-    computed_ranges: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None
 
-    def on_click(event: int, x: int, y: int, *_) -> None:
-        nonlocal current_frame, computed_ranges
-        if event == cv2.EVENT_LBUTTONDOWN and current_frame is not None:
-            n_px = calibrator.add_click(current_frame, x, y)
-            computed_ranges = calibrator.compute_ranges()
-            print(f"[Calibration] Click at ({x}, {y}): +{n_px} px (Total: {calibrator.total_samples})")
-
-    cv2.setMouseCallback(window_name, on_click)
-
+def main():
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--node',required=True,choices=NODES);p.add_argument('--role',required=True,choices=ROLES);p.add_argument('--source');p.add_argument('--profile-dir',default='calibrations');p.add_argument('--width',type=int,default=1200);p.add_argument('--height',type=int,default=800);a=p.parse_args()
+    src=open_source(source_for(a.node,a.source));window=f'Calibrate {a.node}: {a.role.upper()}'
+    cv2.namedWindow(window,cv2.WINDOW_AUTOSIZE)
+    samples=[];frame=None;shown=None;scale=(1.,1.);paused=False;mask_view=False;msg='Click plain fabric of ONE role. At least 5 clicks.'
+    def click(event,x,y,*_):
+        nonlocal msg
+        if event!=cv2.EVENT_LBUTTONDOWN or shown is None:return
+        h,w=shown.shape[:2]; xx=int(x/scale[0]);yy=int((y-34)/scale[1])
+        if not (0<=xx<w and 0<=yy<h):return
+        patch=shown[max(0,yy-4):min(h,yy+5),max(0,xx-4):min(w,xx+5)]
+        px=cv2.cvtColor(patch,cv2.COLOR_BGR2HSV).reshape(-1,3)
+        if np.count_nonzero((px[:,1]>=50)&(px[:,2]>=40))<10:
+            msg='Sample rejected: choose saturated fabric';return
+        samples.append(px);msg=f'{len(samples)} clicks; sample HSV {np.median(px,axis=0).astype(int).tolist()}'
+        print(msg,flush=True)
+    cv2.setMouseCallback(window,click)
     try:
         while True:
-            frame = cam.read()
+            if not paused:
+                incoming,_=src.read()
+                if incoming is not None:frame=incoming
+                elif not isinstance(src,StreamSource):break
+                elif not src.connected:frame=None
             if frame is None:
-                canvas = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(canvas, f"Waiting for stream: {source}", (40, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 180, 255), 2)
-                cv2.imshow(window_name, canvas)
-                if (cv2.waitKey(50) & 0xFF) in (ord("q"), 27):
-                    break
-                continue
+                shown=None;view=np.zeros((400,640,3),np.uint8)
+                cv2.putText(view,'Camera offline - reconnecting',(20,190),cv2.FONT_HERSHEY_SIMPLEX,.7,(255,255,255),2)
+            else:
+                shown=frame;view=frame.copy();h,w=view.shape[:2]
+                if mask_view and len(samples)>=5:
+                    try:
+                        ranges=ranges_from_samples(samples);hsv=cv2.cvtColor(view,cv2.COLOR_BGR2HSV);mask=np.zeros((h,w),np.uint8)
+                        for lo,hi in ranges:mask |= cv2.inRange(hsv,np.array(lo,np.uint8),np.array(hi,np.uint8))
+                        view=cv2.cvtColor(mask,cv2.COLOR_GRAY2BGR)
+                    except ValueError as e:msg=str(e)
+                s=min(a.width/w,(a.height-90)/h);nw,nh=max(1,round(w*s)),max(1,round(h*s));scale=(nw/w,nh/h)
+                view=cv2.resize(view,(nw,nh));top=np.full((34,nw,3),25,np.uint8);bottom=np.full((56,nw,3),25,np.uint8)
+                def line(img,t,y):
+                    fs=min(.58,(nw-16)/max(1,cv2.getTextSize(t,cv2.FONT_HERSHEY_SIMPLEX,1,1)[0][0]));cv2.putText(img,t,(8,y),cv2.FONT_HERSHEY_SIMPLEX,fs,(230,240,240),1,cv2.LINE_AA)
+                line(top,f'{a.role.upper()} | {a.node} | {"PAUSED" if paused else "LIVE"} | {len(samples)} samples',23)
+                line(bottom,msg,20);line(bottom,'P pause | M mask | U undo | R reset | S save | Q quit',44)
+                view=np.vstack([top,view,bottom])
+            cv2.imshow(window,view);key=cv2.waitKey(20)&255
+            if key in (ord('q'),27):break
+            if key==ord('p'):paused=not paused
+            if key==ord('m'):mask_view=not mask_view
+            if key==ord('u') and samples:samples.pop();msg=f'{len(samples)} clicks remaining'
+            if key==ord('r'):samples.clear();msg='Samples reset; previous saved profile unchanged'
+            if key==ord('s'):
+                try:path,ranges=save_profile(a.node,a.role,samples,a.profile_dir);msg=f'Saved {path}';print(msg,ranges,flush=True)
+                except ValueError as e:msg=str(e);print(msg,flush=True)
+            try:
+                if cv2.getWindowProperty(window,cv2.WND_PROP_VISIBLE)<1:break
+            except cv2.error:break
+    finally:src.close();cv2.destroyAllWindows()
 
-            current_frame = frame
-            view = frame.copy()
-
-            if computed_ranges:
-                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-                for lo, hi in computed_ranges:
-                    mask |= cv2.inRange(hsv, lo, hi)
-
-                if show_mask:
-                    view = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-                else:
-                    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    for c in contours:
-                        if cv2.contourArea(c) > 300:
-                            cv2.drawContours(view, [c], -1, (0, 255, 0), 2)
-
-            hud = f"Samples: {calibrator.total_samples} | Ranges: {len(computed_ranges) if computed_ranges else 0}"
-            cv2.rectangle(view, (6, 6), (450, 36), (20, 20, 20), -1)
-            cv2.putText(view, hud, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                        (0, 255, 0) if computed_ranges else (0, 220, 255), 1)
-
-            cv2.imshow(window_name, view)
-            key = cv2.waitKey(30) & 0xFF
-            if key in (ord("q"), 27):
-                break
-            elif key == ord("m"):
-                show_mask = not show_mask
-            elif key == ord("r"):
-                calibrator.reset()
-                computed_ranges = None
-                print("[Calibration] Reset samples.")
-            elif key == ord("s"):
-                if computed_ranges:
-                    save_calibration(computed_ranges, path=args.out, name=args.name)
-                else:
-                    print("[Calibration] Click on the shirt first to sample colors.")
-    finally:
-        cam.close()
-        cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__':main()

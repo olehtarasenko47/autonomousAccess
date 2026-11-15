@@ -1,267 +1,199 @@
 #!/usr/bin/env python3
-"""Live shirt colour recognition using calibrated HSV ranges and YOLO-pose torso isolation."""
+"""ZoneGuard: one phone, one processing laptop, one role-based access zone."""
 from __future__ import annotations
-import argparse
-import json
+import argparse, os, time
+from collections import Counter, deque
+from dataclasses import dataclass
 from pathlib import Path
-import time
-from collections import deque
 import cv2
 import numpy as np
+from calibration import load_profiles, source_for
+from peer_state import NODES, ROLES, LABELS, POLICY, State, Peer, PORT, new_event
 from torso import isolate_torso_mask
+from video_source import open_source, StreamSource
+from telegram_alerts import TelegramAlerter
 
-MATCH='match'; OTHER='other'; UNKNOWN='unknown'
-GREEN=(105,232,125); RED=(75,75,255); AMBER=(70,200,255); WHITE=(240,245,248)
+GREEN=(110,232,145); RED=(75,75,255); AMBER=(70,200,255); WHITE=(240,245,248)
 FONT=cv2.FONT_HERSHEY_SIMPLEX
 
+@dataclass(frozen=True)
+class Shirt:
+    role: str
+    colour: str
+    score: float
+    uncertain: bool=False
 
-class ShirtClassifier:
-    """HSV shirt colour classifier using calibrated ranges from colour.json."""
-    def __init__(self, ranges, min_pixels=120, match_min=.25, other_max=.10):
-        if not 0 <= other_max < match_min <= 1: raise ValueError('Invalid colour thresholds')
-        self.ranges=[]
-        for lo,hi in ranges:
-            if len(lo)!=3 or len(hi)!=3 or not all(0<=a<=b<=m for a,b,m in zip(lo,hi,(179,255,255))):
-                raise ValueError('Invalid HSV range')
-            self.ranges.append((np.array(lo,np.uint8),np.array(hi,np.uint8)))
-        if not self.ranges:raise ValueError('No HSV ranges provided')
-        self.min_pixels=min_pixels;self.match_min=match_min;self.other_max=other_max
-
-    def fraction(self,hsv,mask):
-        if hsv.size==0 or mask.size==0:return None
-        valid=mask>0; n=np.count_nonzero(valid)
-        if n<self.min_pixels:return None
-        hit=np.zeros(mask.shape,np.uint8)
-        for lo,hi in self.ranges:hit |= cv2.inRange(hsv,lo,hi)
-        return np.count_nonzero((hit>0)&valid)/n
-
-    def classify(self,hsv,mask):
-        fraction=self.fraction(hsv,mask)
-        if fraction is None:return UNKNOWN
-        return MATCH if fraction>=self.match_min else OTHER if fraction<=self.other_max else UNKNOWN
-
-
-class MultiColourClassifier:
-    """One separately calibrated HSV profile per named colour."""
-    def __init__(self,profiles,match_min=.25,other_max=.10,margin=.08):
-        if not 0 <= margin <= 1:raise ValueError('Invalid colour margin')
-        self.profiles={name:ShirtClassifier(ranges,match_min=match_min,other_max=other_max)
-                       for name,ranges in profiles.items()}
-        if not self.profiles:raise ValueError('No colour profiles')
-        self.match_min=match_min;self.other_max=other_max;self.margin=margin
-
-    def classify(self,hsv,mask):
-        scores=[(c.fraction(hsv,mask),name) for name,c in self.profiles.items()]
-        if any(score is None for score,name in scores):return UNKNOWN
-        scores.sort(reverse=True)
-        best,name=scores[0]
-        if best<=self.other_max:return OTHER
-        if best<self.match_min:return UNKNOWN
-        if len(scores)>1 and best-scores[1][0]<self.margin:return UNKNOWN
-        return name
+class Classifier:
+    def __init__(self,profiles,match_min=.30,other_max=.10,margin=.10):
+        if not 0<=other_max<match_min<=1 or not 0<=margin<=1:raise ValueError('Invalid thresholds')
+        self.profiles={role:[(np.array(lo,np.uint8),np.array(hi,np.uint8)) for lo,hi in ranges] for role,ranges in profiles.items()}
+        self.match_min,self.other_max,self.margin=match_min,other_max,margin
+    def classify(self,hsv,mask,tier):
+        valid=mask>0;n=int(np.count_nonzero(valid))
+        if n<120 or hsv.size==0:return Shirt('hacker','uncertain',0,True)
+        if not self.profiles:return Shirt('hacker','uncalibrated',0,True)
+        scores=[]
+        for role,ranges in self.profiles.items():
+            hit=np.zeros(mask.shape,np.uint8)
+            for lo,hi in ranges:hit|=cv2.inRange(hsv,lo,hi)
+            scores.append((float(np.count_nonzero((hit>0)&valid))/n,role))
+        scores.sort(reverse=True);best,role=scores[0]
+        if best<=self.other_max:
+            return Shirt('hacker','other',best,tier==4)
+        if best<self.match_min or (len(scores)>1 and best-scores[1][0]<self.margin):
+            return Shirt('hacker','uncertain',best,True)
+        if tier==4 and role!='hacker':return Shirt('hacker','uncertain',best,True)
+        return Shirt(role,'purple' if role=='hacker' else role,best)
 
 
-def colour_label(colour,color_name):
-    return color_name.upper() if colour==MATCH else 'OTHER' if colour==OTHER else 'CHECK SHIRT' if colour==UNKNOWN else colour.upper()
+def decision(mode,shirt,inside=True):
+    if not inside or mode=='public':return 'allowed'
+    if shirt.uncertain:return 'review'
+    return 'allowed' if shirt.role in POLICY[mode] else 'violation'
 
 
-def fit(frame,width,height):
-    h,w=frame.shape[:2];s=min(width/w,(height-60)/h)
-    nw,nh=max(1,round(w*s)),max(1,round(h*s))
-    return cv2.resize(frame,(nw,nh),interpolation=cv2.INTER_LINEAR if s>1 else cv2.INTER_AREA),nw/w,nh/h
+class Gate:
+    """Three observations over >=0.35s; one event per track/decision/occupancy.
+    IDs are ephemeral, never shared as identity or used for facial recognition.
+    """
+    def __init__(self):self.tracks={}
+    def clear(self):self.tracks.clear()
+    def update(self,track,shirt,inside,mode,now):
+        verdict=decision(mode,shirt,inside);key=(shirt.role,shirt.colour,verdict,inside)
+        old=self.tracks.get(track)
+        if old is None or now-old['last']>1.5:
+            old=dict(key=None,first=now,n=0,last=now,emitted=set());self.tracks[track]=old
+        if not inside:old['emitted'].clear()
+        if old['key']!=key:old.update(key=key,first=now,n=1)
+        else:old['n']+=1
+        old['last']=now
+        stable=old['n']>=3 and now-old['first']>=.35
+        if not stable and inside and mode!='public':return 'pending',False
+        emit=verdict in ('review','violation') and verdict not in old['emitted']
+        if emit:old['emitted'].add(verdict)
+        return verdict,emit
+    def prune(self,now):
+        for k in list(self.tracks):
+            if now-self.tracks[k]['last']>1.5:del self.tracks[k]
 
 
-def text(img,label,x,y,scale=.65,colour=WHITE,thick=2):
-    w=img.shape[1]; x=max(0,int(x)); y=int(y)
-    tw=cv2.getTextSize(label,FONT,scale,thick)[0][0]
-    if tw>w-x-8:scale*=max(.1,(w-x-8)/max(1,tw))
-    cv2.putText(img,label,(x,y),FONT,scale,colour,thick,cv2.LINE_AA)
+def text(img,s,x,y,scale=.65,c=WHITE,thick=2):
+    avail=max(1,img.shape[1]-x-8);tw=cv2.getTextSize(s,FONT,scale,thick)[0][0]
+    scale*=min(1,avail/max(1,tw));cv2.putText(img,s,(int(x),int(y)),FONT,scale,c,thick,cv2.LINE_AA)
 
 
-def label(img,value,center,y,c):
-    h,w=img.shape[:2];scale=.68;thick=2
-    tw,th=cv2.getTextSize(value,FONT,scale,thick)[0]
-    if tw>w-16:
-        scale*= (w-16)/tw;tw,th=cv2.getTextSize(value,FONT,scale,thick)[0]
-    x=max(4,min(w-tw-12,int(center-tw/2-4)));y=max(th+10,min(h-5,int(y)))
-    cv2.rectangle(img,(x,y-th-7),(min(w-1,x+tw+10),y+5),(20,24,30),-1)
-    text(img,value,x+5,y,scale,c,thick)
-
-
-def render(frame,people,color_name,width=1100,height=780,rate=0,cap=0,offline=False):
-    img,sx,sy=fit(frame,width,height);h,w=img.shape[:2]
-    for box,colour in people:
-        x1,y1,x2,y2=[round(v*s) for v,s in zip(box,(sx,sy,sx,sy))]
-        x1=max(0,min(w-1,x1));x2=max(0,min(w-1,x2));y1=max(0,min(h-1,y1));y2=max(0,min(h-1,y2))
-        c=RED if colour==OTHER else AMBER if colour==UNKNOWN else GREEN
-        cv2.rectangle(img,(x1,y1),(x2,y2),c,3,cv2.LINE_AA)
-        name=colour_label(colour,color_name)
-        label(img,name,(x1+x2)/2,y1-7,c)
-    status=np.full((56,w,3),25,np.uint8)
-    if offline:
-        status[:]=(36,75,125);text(status,'CAMERA OFFLINE - reconnecting',10,23,.7,WHITE)
-    else:
-        text(status,f'Looking for: {color_name}',10,24,.70,GREEN)
-    text(status,f'People {len(people)} | AI {rate:.1f} FPS | Camera {cap:.1f}',10,46,.55,WHITE,1)
-    return np.vstack((img,status))
-
-
-
-def zone_for(box, frame_width, split=.5):
-    """Use the centre of the person box; a zone is an image region, not a doorway."""
-    return 1 if (float(box[0])+float(box[2]))/2 < frame_width*split else 2
-
-
-def zone_summary(people, frame_width, split=.5, allowed=None):
-    """Only a confident non-match in Zone 2 triggers a violation."""
-    allowed={MATCH} if allowed is None else allowed
-    violations=sum(colour!=UNKNOWN and colour not in allowed and zone_for(box,frame_width,split)==2
-                   for box,colour in people)
-    reviews=sum(colour==UNKNOWN and zone_for(box,frame_width,split)==2
-                for box,colour in people)
-    return violations,reviews
-
-
-def render_zones(frame,people,color_name,width=1100,height=780,rate=0,cap=0,
-                 offline=False,split=.5,allowed=None):
-    # Fit the actual image into the available screen area. No fixed-size canvas
-    # or black padding: the header and footer are exactly the image width.
-    header_h,footer_h=36,66
-    h0,w0=frame.shape[:2]
-    scale=min(width/w0,(height-header_h-footer_h)/h0)
-    w,h=max(1,round(w0*scale)),max(1,round(h0*scale))
+def render(frame,people,node,width,height,fps,cap,peers,events,missing,split=None,offline=False,telegram_status='off'):
+    zone,mode,_,_=NODES[node];h0,w0=frame.shape[:2];hh,fh=50,87
+    scale=min(width/w0,(height-hh-fh)/h0);w,h=max(1,round(w0*scale)),max(1,round(h0*scale))
     img=cv2.resize(frame,(w,h),interpolation=cv2.INTER_LINEAR if scale>1 else cv2.INTER_AREA)
     sx,sy=w/w0,h/h0
-    line=max(1,min(w-1,round(w*split)))
-    cv2.line(img,(line,0),(line,h-1),WHITE,2,cv2.LINE_AA)
-    allowed={MATCH} if allowed is None else allowed
-    allowed_label="PURPLE" if allowed=={MATCH} else "/".join(sorted(allowed)).upper()
-    violations,reviews=zone_summary(people,w0,split,allowed) if not offline else (0,0)
-    for box,colour in people if not offline else []:
-        zone=zone_for(box,w0,split)
-        violation=zone==2 and colour!=UNKNOWN and colour not in allowed
-        review=zone==2 and colour==UNKNOWN
-        c=RED if violation else AMBER if review or colour==UNKNOWN else GREEN
-        x1,y1,x2,y2=[round(v*s) for v,s in zip(box,(sx,sy,sx,sy))]
-        x1=max(0,min(w-1,x1)); x2=max(0,min(w-1,x2))
-        y1=max(0,min(h-1,y1)); y2=max(0,min(h-1,y2))
-        cv2.rectangle(img,(x1,y1),(x2,y2),c,3,cv2.LINE_AA)
-        name=colour_label(colour,'purple' if colour==MATCH else color_name)
-        label(img,name,(x1+x2)/2,y1-7,c)
-    header=np.full((header_h,w,3),25,np.uint8)
-    header[:,:line]=(36,70,43); header[:,line:]=(79,49,67)
-    cv2.line(header,(line,0),(line,header_h-1),WHITE,2)
-    def zone_title(value,left,right):
-        available=max(1,right-left-12)
-        fs=.65; thick=1
-        tw=cv2.getTextSize(value,FONT,fs,thick)[0][0]
-        fs*=min(1,available/max(1,tw))
-        tw=cv2.getTextSize(value,FONT,fs,thick)[0][0]
-        cv2.putText(header,value,(max(left+3,(left+right-tw)//2),24),FONT,fs,WHITE,thick,cv2.LINE_AA)
-    zone_title('ZONE 1 - ALL',0,line)
-    zone_title('ZONE 2 - '+allowed_label+' ONLY',line,w)
-    status=np.full((footer_h,w,3),25,np.uint8)
-    if offline:
-        status[:]=(36,75,125); msg='CAMERA OFFLINE - reconnecting'; c=WHITE
-    elif violations:
-        status[:]=(35,35,170);msg=f'ALERT: {violations} UNAUTHORISED IN ZONE 2';c=WHITE
-    elif reviews:
-        status[:]=(35,85,130);msg=f'CHECK SHIRT: {reviews} IN ZONE 2';c=WHITE
-    else:
-        msg='ALL CLEAR - no restricted entry';c=GREEN
-    text(status,msg,10,25,.72,c)
-    text(status,f'People {len(people) if not offline else 0} | AI {rate:.1f} FPS | Camera {cap:.1f}',10,51,.62,WHITE,1)
-    return np.vstack((header,img,status))
+    if split is not None:cv2.line(img,(round(w*split),0),(round(w*split),h-1),WHITE,2,cv2.LINE_AA)
+    for box,shirt,verdict in people if not offline else []:
+        x1,y1,x2,y2=[int(round(v*s)) for v,s in zip(box,(sx,sy,sx,sy))];x1,x2=np.clip([x1,x2],0,w-1);y1,y2=np.clip([y1,y2],0,h-1)
+        c=RED if verdict=='violation' else AMBER if verdict in ('review','pending') else GREEN
+        cv2.rectangle(img,(int(x1),int(y1)),(int(x2),int(y2)),c,2,cv2.LINE_AA)
+        # Purple is identified as HACKER; other clothes have the same role.
+        name=shirt.role.upper() if verdict!='pending' or shirt.role=='hacker' else 'CHECKING'
+        if shirt.role=='hacker':name+=' (PURPLE)' if shirt.colour=='purple' else ' (CHECK)' if shirt.uncertain else ' (OTHER)'
+        tw,th=cv2.getTextSize(name,FONT,.62,1)[0];tw=min(tw,w-10);x=max(4,min(w-tw-8,int((x1+x2-tw)/2)));y=max(20,int(y1)-7)
+        cv2.rectangle(img,(x,y-18),(min(w-1,x+tw+7),y+4),(20,24,30),-1);text(img,name,x+3,y,.62,c,1)
+    head=np.full((hh,w,3),25,np.uint8);head[:]=(38,55,45) if mode=='public' else (56,43,66)
+    text(head,f'ZONE {zone} | {LABELS[zone].upper()} | {node}',10,20,.68,WHITE)
+    allowed='EVERYONE' if mode=='public' else ', '.join(sorted(POLICY[mode])).upper()
+    text(head,('LEFT PUBLIC / RIGHT: ' if split is not None else 'ALLOWED: ')+allowed,10,41,.53,WHITE,1)
+    footer=np.full((fh,w,3),25,np.uint8);viol=sum(v=='violation' for _,_,v in people);reviews=sum(v in ('pending','review') for _,_,v in people)
+    if offline:footer[:]=(35,70,115);msg='CAMERA OFFLINE - reconnecting';col=WHITE
+    elif viol:footer[:]=(35,35,165);msg=f'ALERT: {viol} POTENTIAL ACCESS VIOLATION(S)';col=WHITE
+    elif reviews:footer[:]=(35,80,115);msg=f'CHECK ACCESS: {reviews} person(s)';col=WHITE
+    else:msg='ALL CLEAR' if mode!='public' else 'PUBLIC - EVERYONE ALLOWED';col=GREEN
+    text(footer,msg,10,25,.72,col)
+    text(footer,f'People {len(people) if not offline else 0} | AI {fps:.1f} FPS | Camera {cap:.1f} | Nodes {peers}/3 | Events {events}',10,48,.56,WHITE,1)
+    text(footer,('CALIBRATE: '+', '.join(missing) if missing else 'All four roles calibrated')+f' | Telegram {telegram_status}',10,72,.54,WHITE,1)
+    return np.vstack((head,img,footer))
 
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--source',default='0');ap.add_argument('--profile',default='colour.json');ap.add_argument('--model',default='yolo11n-pose.pt')
-    ap.add_argument('--colour',action='append',default=[],metavar='NAME=FILE',help='Independent named colour profile; repeat for each colour')
-    ap.add_argument('--allow-zone2',nargs='+',default=None,metavar='COLOUR',help='Allowed named colours in Zone 2 (default purple)')
-    ap.add_argument('--colour-margin',type=float,default=.08,help='Minimum lead over second colour')
-    ap.add_argument('--imgsz',type=int,default=640);ap.add_argument('--device')
-    ap.add_argument('--width',type=int,default=1100);ap.add_argument('--height',type=int,default=780)
-    ap.add_argument('--match-min',type=float,default=.25);ap.add_argument('--other-max',type=float,default=.10)
-    ap.add_argument('--two-zones',action='store_true',help='Zone 1: all; Zone 2: calibrated purple shirts only')
-    ap.add_argument('--split',type=float,default=.5,help='Horizontal fraction of the zone boundary (default .5)')
-    a=ap.parse_args()
-    if not .15 <= a.split <= .85:ap.error('--split must be between .15 and .85')
-    if a.width<400 or a.height<350:ap.error('preview at least 400 x 350')
-    def load_ranges(filename):
-        p=Path(filename)
-        if not p.is_file():ap.error(f'{filename} not found — run calibrate_colour.py first')
-        data=json.loads(p.read_text(encoding='utf-8'))
-        print(f'[colour] loaded {p}: {data.get("name","shirt")} {data["hsv_ranges"]}',flush=True)
-        return data
-    allowed=None
-    if a.colour:
-        profiles={}
-        for spec in a.colour:
-            name,sep,filename=spec.partition('=');name=name.strip().lower()
-            if not sep or not name or not filename or name in (MATCH,OTHER,UNKNOWN) or name in profiles:
-                ap.error('Each --colour must have a unique NAME=FILE (not match, other or unknown)')
-            profiles[name]=load_ranges(filename)['hsv_ranges']
-        classifier=MultiColourClassifier(profiles,a.match_min,a.other_max,a.colour_margin)
-        color_name=', '.join(profiles)
-        allowed={n.lower() for n in (a.allow_zone2 or ['purple'])}
-        if a.two_zones and not allowed.issubset(profiles):ap.error('--allow-zone2 must name calibrated colours; default is purple')
-    else:
-        if a.allow_zone2 is not None:ap.error('--allow-zone2 requires named --colour profiles')
-        data=load_ranges(a.profile)
-        color_name=data.get('name','shirt')
-        classifier=ShirtClassifier(data['hsv_ranges'],match_min=a.match_min,other_max=a.other_max)
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--node',required=True,choices=NODES);p.add_argument('--source');p.add_argument('--profile-dir',default='calibrations');p.add_argument('--model',default='yolo11n-pose.pt');p.add_argument('--imgsz',type=int,default=640);p.add_argument('--device');p.add_argument('--width',type=int,default=1400);p.add_argument('--height',type=int,default=900);p.add_argument('--split',type=float,help='Optional test: left public, right monitored zone');p.add_argument('--peer',action='append',default=[],help='Other LAPTOP IP (or IP:port), repeat twice');p.add_argument('--port',type=int,default=PORT);p.add_argument('--deployment',default='durhack-access-v2');p.add_argument('--db');p.add_argument('--telegram',action='store_true');p.add_argument('--telegram-photos',action='store_true',help='Only with organiser approval');p.add_argument('--cooldown',type=float,default=60);p.add_argument('--headless',action='store_true');p.add_argument('--max-frames',type=int,default=0);a=p.parse_args()
+    if a.width<400 or a.height<350 or (a.split is not None and not .1<=a.split<=.9) or a.cooldown<1:p.error('Invalid dimensions, split or cooldown')
+    if a.peer and not os.getenv('ZONEGUARD_PEER_KEY'):p.error('Set ZONEGUARD_PEER_KEY on all laptops before using --peer')
+    if a.telegram_photos and not a.telegram:p.error('--telegram-photos requires --telegram')
+    zone,mode,_,_=NODES[a.node]
+    try:profiles=load_profiles(a.node,a.profile_dir)
+    except (ValueError,OSError,KeyError) as e:p.error(str(e))
+    missing=[r for r in ROLES if r not in profiles];classifier=Classifier(profiles)
+    if missing:print('[calibration] Missing:',', '.join(missing),'; no clearance for uncalibrated roles',flush=True)
+    if a.telegram and missing and mode!='public':p.error('Calibrate all four roles before enabling Telegram on a restricted node. Preview works without --telegram.')
+    if a.telegram and (not os.getenv('TELEGRAM_BOT_TOKEN') or not os.getenv('TELEGRAM_CHAT_ID')):p.error('Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID')
     from ultralytics import YOLO
-    from video_source import StreamSource,open_source
-    model=YOLO(a.model);src=open_source(a.source)
-    window='Two-zone Access Test' if a.two_zones else 'Shirt Colour Recognition'
-    cv2.namedWindow(window,cv2.WINDOW_AUTOSIZE if a.two_zones else cv2.WINDOW_NORMAL|cv2.WINDOW_KEEPRATIO)
-    def preview(frame,people,rate=0,cap=0,offline=False):
-        if a.two_zones:
-            return render_zones(frame,people,color_name,a.width,a.height,rate,cap,offline,a.split,allowed)
-        return render(frame,people,color_name,a.width,a.height,rate,cap,offline)
-    last_at=None;last_frame=None;last_size=None;times=deque(maxlen=30)
-
-    def show(img):
-        nonlocal last_size
-        size=(img.shape[1],img.shape[0]);cv2.imshow(window,img)
-        if size!=last_size:
-            if not a.two_zones:cv2.resizeWindow(window,*size)
-            last_size=size
-
-    def keys():
-        if cv2.waitKey(1)&255 in (ord('q'),27):return True
-        try:return cv2.getWindowProperty(window,cv2.WND_PROP_VISIBLE)<1
-        except cv2.error:return True
-
+    model=YOLO(a.model);src=open_source(source_for(a.node,a.source));state=None;peer=None;bot=None
+    window=f'ZoneGuard | {a.node} | Zone {zone} - {LABELS[zone]}'
     try:
+        state=State(a.node,a.db or str(Path('runtime')/a.deployment/(a.node+'.sqlite3')))
+        peer=Peer(state,a.peer,a.port,os.getenv('ZONEGUARD_PEER_KEY'),a.deployment)
+        if a.telegram:
+            bot=TelegramAlerter.from_env(a.node,zone_labels={z:f'Zone {z} - {label}' for z,label in LABELS.items()},cooldown=a.cooldown,send_photos=a.telegram_photos,status_fn=lambda:state.status_lines()+[f'Replicated events: {state.event_count()}'],on_mute=peer.mute)
+            bot.start()
+        if not a.headless:cv2.namedWindow(window,cv2.WINDOW_AUTOSIZE)
+        gate=Gate();times=deque(maxlen=30);last_at=None;last_frame=None;last_gen=None;frames=0;offline=False;last_mute=None
+        print(f'[access] {a.node}: Zone {zone} {mode}, allowed {sorted(POLICY[mode])}; {len(a.peer)} configured peers',flush=True)
+        def keys():
+            if a.headless:return False
+            key=cv2.waitKey(1)&255
+            if key in (ord('q'),27):return True
+            if key==ord('c'):peer.enabled=not peer.enabled;print('[peer]', 'enabled' if peer.enabled else 'paused',flush=True)
+            if key==ord('p'):print('\n'.join(state.status_lines()),flush=True)
+            try:return cv2.getWindowProperty(window,cv2.WND_PROP_VISIBLE)<1
+            except cv2.error:return True
+        def bot_status():return 'off' if not bot else f'queued {bot.queued()}'
         while True:
+            if bot:
+                until=state.mute_until(zone)
+                if until!=last_mute:bot.mute_until(zone,until);last_mute=until
             frame,ts=src.read();now=time.monotonic()
             if frame is None:
                 if not isinstance(src,StreamSource):break
-                if last_at is None or now-last_at>1:
-                    base=last_frame if last_frame is not None else np.zeros((480,640,3),np.uint8)
-                    show(preview(base,[],offline=True))
+                if last_at is None or now-last_at>1.0:
+                    if not offline:gate.clear();state.update('offline');offline=True
+                    if not a.headless:cv2.imshow(window,render(last_frame if last_frame is not None else np.zeros((480,640,3),np.uint8),[],a.node,a.width,a.height,0,0,state.online_count(),state.event_count(),missing,a.split,True,bot_status()))
                 if keys():break
                 continue
-            last_at=now;last_frame=frame
-            args_dict=dict(imgsz=a.imgsz,conf=.30,iou=.50,verbose=False)
-            if a.device:args_dict['device']=a.device
-            results=model(frame,**args_dict);people=[]
+            gen=getattr(src,'last_generation',0)
+            if last_gen!=gen or offline:
+                gate.clear();times.clear()
+                for tracker in getattr(getattr(model,'predictor',None),'trackers',[]):
+                    if hasattr(tracker,'reset'):tracker.reset()
+            last_gen=gen;offline=False;last_at=now;last_frame=frame;frames+=1
+            kwargs=dict(persist=True,tracker='bytetrack.yaml',imgsz=a.imgsz,conf=.30,iou=.50,verbose=False)
+            if a.device:kwargs['device']=a.device
+            results=model.track(frame,**kwargs);people=[];pending_events=[];counts=Counter()
             if results and results[0].boxes is not None and len(results[0].boxes):
-                r=results[0];boxes=r.boxes.xyxy.cpu().numpy()
+                r=results[0];boxes=r.boxes.xyxy.cpu().numpy();ids=r.boxes.id.cpu().numpy().astype(int) if r.boxes.id is not None else None
                 kps=r.keypoints.data.cpu().numpy() if r.keypoints is not None and r.keypoints.data is not None else None
-                hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
+                hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV);gate.prune(now)
                 for i,box in enumerate(boxes):
                     torso=isolate_torso_mask(frame.shape,i,boxes,kps[i] if kps is not None and i<len(kps) else None)
-                    x1,y1,x2,y2=torso.crop_bbox
-                    raw=classifier.classify(hsv[y1:y2,x1:x2],torso.crop_mask)
-                    if torso.tier==4 and raw==OTHER:raw=UNKNOWN
-                    people.append((box,raw))
-            times.append(time.monotonic());rate=(len(times)-1)/max(.001,times[-1]-times[0]) if len(times)>1 else 0
-            show(preview(frame,people,rate,getattr(src,'capture_fps',0)))
-            if keys():break
+                    x1,y1,x2,y2=torso.crop_bbox;shirt=classifier.classify(hsv[y1:y2,x1:x2],torso.crop_mask,torso.tier)
+                    inside=a.split is None or (float(box[0])+float(box[2]))/2 >= frame.shape[1]*a.split
+                    if ids is None:verdict='allowed' if not inside or mode=='public' else 'pending';emit=False
+                    else:verdict,emit=gate.update(int(ids[i]),shirt,inside,mode,now)
+                    if inside:counts[shirt.role if verdict!='pending' else 'hacker']+=1
+                    people.append((box,shirt,verdict))
+                    if emit:pending_events.append(new_event(a.node,shirt.role,shirt.colour,verdict,int(ids[i]),shirt.score,ts))
+            state.update('online',counts);times.append(time.monotonic());fps=(len(times)-1)/max(.001,times[-1]-times[0]) if len(times)>1 else 0
+            preview=render(frame,people,a.node,a.width,a.height,fps,getattr(src,'capture_fps',0),state.online_count(),state.event_count(),missing,a.split,False,bot_status()) if not a.headless or a.telegram_photos else None
+            for event in pending_events:
+                if not peer.publish(event):continue
+                print(f"[access] Zone {zone}: {event['role']} ({event['shirt']}) -> {event['decision']} | {event['id']}",flush=True)
+                if bot and event['decision']=='violation':
+                    try:bot.intrusion(zone,frame=preview if a.telegram_photos else None,ts=event['ts'],note=f"Detected role: {event['role']}; shirt: {event['shirt']}. Please verify in person. Event: {event['id']}")
+                    except (OSError,ValueError,cv2.error) as e:print('[telegram] could not queue alert:',type(e).__name__,flush=True)
+            if not a.headless:cv2.imshow(window,preview)
+            if keys() or (a.max_frames and frames>=a.max_frames):break
     except KeyboardInterrupt:pass
-    finally:src.close();cv2.destroyAllWindows()
+    finally:
+        if bot:bot.stop()
+        if peer:peer.close()
+        if state:state.close()
+        src.close();cv2.destroyAllWindows()
 
 if __name__=='__main__':main()

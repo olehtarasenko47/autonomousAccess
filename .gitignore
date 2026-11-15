@@ -1,14 +1,10 @@
-# Python
+# Python / IDE
 __pycache__/
 *.pyc
-.venv
 .venv/
 venv/
-
-# PyCharm / IDE
 .idea/
-
-# Large weights and media files
+# Models and media
 *.pt
 *.onnx
 *.mp4
@@ -19,6 +15,17 @@ venv/
 *.png
 logs/
 snapshots/
-
-# Allow sample config/calibration JSON files
-!colour.json
+# Local configuration, secrets, state and update archives
+.env
+.env.*
+calibrations/
+colour.json
+colour_*.json
+runtime/
+telegram_outbox/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.npz
+identity_models/
+*.zip

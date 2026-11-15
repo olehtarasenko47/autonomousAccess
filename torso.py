@@ -213,8 +213,7 @@ def isolate_torso_mask(
                 if ox2 > ox1 and oy2 > oy1:
                     mask_after_sub[oy1:oy2, ox1:ox2] = 0
 
-        if np.count_nonzero(mask_after_sub) >= 4:
-            mask = mask_after_sub
+        mask = mask_after_sub  # Never restore an occluded torso as if it were visible.
 
     return TorsoIsolationResult(
         tier=tier,
