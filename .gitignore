@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv
+.venv/
+venv/
+
+# PyCharm / IDE
+.idea/
+
+# Large weights and media files
+*.pt
+*.onnx
+*.mp4
+*.mov
+*.avi
+*.jpg
+*.jpeg
+*.png
+logs/
+snapshots/
+
+# Allow sample config/calibration JSON files
+!colour.json

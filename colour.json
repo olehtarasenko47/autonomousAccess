@@ -1,0 +1,18 @@
+{
+  "name": "calibrated_shirt",
+  "hsv_ranges": [
+    [
+      [
+        120,
+        45,
+        55
+      ],
+      [
+        141,
+        255,
+        255
+      ]
+    ]
+  ],
+  "samples": 13
+}
